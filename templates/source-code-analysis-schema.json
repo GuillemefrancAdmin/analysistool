@@ -1,0 +1,1005 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LegacySourceCodeAnalysisReport",
+  "description": "Strict JSON Schema specification for LLM-driven structural, functional, and quality analysis of legacy source code modules.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "module_metadata",
+    "source_evidence",
+    "execution_context",
+    "interface_contracts",
+    "architectural_layer",
+    "quality_metrics",
+    "functional_requirements",
+    "technical_debt_and_code_smells",
+    "dependencies_and_integrations",
+    "security_findings",
+    "data_lineage",
+    "exception_handling",
+    "test_status",
+    "business_impact",
+    "iso_25010_attributes",
+    "modernization_recommendations",
+    "token_usage"
+  ],
+  "properties": {
+    "module_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_path",
+        "programming_language",
+        "language_version",
+        "module_scope",
+        "primary_purpose"
+      ],
+      "properties": {
+        "file_path": {
+          "type": "string",
+          "description": "Relative or absolute filesystem path of the analyzed source code file."
+        },
+        "programming_language": {
+          "type": "string",
+          "description": "Programming language of the target artifact (e.g., COBOL, Java, C, Python, Fortran)."
+        },
+        "language_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Specific dialect or language version identified, if determinable."
+        },
+        "module_scope": {
+          "type": "string",
+          "enum": [
+            "file",
+            "class",
+            "package",
+            "procedure",
+            "module",
+            "script"
+          ],
+          "description": "Granularity level of the analyzed source code unit."
+        },
+        "primary_purpose": {
+          "type": "string",
+          "description": "Concise summary of the functional role fulfilled by this module within the broader application."
+        }
+      }
+    },
+    "source_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "symbol_name",
+        "source_line_start",
+        "source_line_end",
+        "analysis_basis",
+        "confidence_level",
+        "evidence_summary"
+      ],
+      "properties": {
+        "symbol_name": {
+          "type": "string",
+          "description": "Name of the function, procedure, class, or routine analyzed."
+        },
+        "source_line_start": {
+          "type": "integer",
+          "description": "Starting line number of the analyzed block in the source file."
+        },
+        "source_line_end": {
+          "type": "integer",
+          "description": "Ending line number of the analyzed block in the source file."
+        },
+        "analysis_basis": {
+          "type": "string",
+          "enum": [
+            "direct_code",
+            "inferred_from_patterns",
+            "schema_cross_reference",
+            "manual_assumption"
+          ],
+          "description": "Basis used to derive the analysis result."
+        },
+        "confidence_level": {
+          "type": "number",
+          "description": "Confidence score between 0.0 and 1.0 for the evidentiary strength of the analysis."
+        },
+        "evidence_summary": {
+          "type": "string",
+          "description": "Short narrative explaining the code evidence used to support the conclusions."
+        }
+      }
+    },
+    "execution_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entrypoint_type",
+        "trigger_or_invocation",
+        "runtime_environment",
+        "config_files_used",
+        "environment_variables_used"
+      ],
+      "properties": {
+        "entrypoint_type": {
+          "type": "string",
+          "enum": [
+            "batch_job",
+            "api_endpoint",
+            "screen_transaction",
+            "scheduled_process",
+            "cli_command",
+            "report_generator",
+            "message_handler"
+          ],
+          "description": "Runtime mode through which the module is invoked."
+        },
+        "trigger_or_invocation": {
+          "type": "string",
+          "description": "How the routine starts or is called in production or the target environment."
+        },
+        "runtime_environment": {
+          "type": "string",
+          "description": "Operating system, runtime, server, or platform context where the code executes."
+        },
+        "config_files_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Configuration files, parameter files, or environment manifests influencing behavior."
+        },
+        "environment_variables_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Environment variables or runtime flags consumed by the logic."
+        }
+      }
+    },
+    "interface_contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_schema",
+        "output_schema",
+        "data_formats",
+        "parameter_validation_rules",
+        "default_and_null_handling"
+      ],
+      "properties": {
+        "input_schema": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Input parameters, record fields, or payload elements accepted by the module."
+        },
+        "output_schema": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Output values, generated records, or response fields produced by the module."
+        },
+        "data_formats": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Formats processed by the module such as JSON, CSV, flat file, fixed-width, XML, or DB records."
+        },
+        "parameter_validation_rules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Rules used to reject or normalize input values."
+        },
+        "default_and_null_handling": {
+          "type": "string",
+          "description": "Description of null/default behavior in the module's parameter or result handling."
+        }
+      }
+    },
+    "architectural_layer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_layer",
+        "layer_confidence_score",
+        "entry_points",
+        "state_management_pattern"
+      ],
+      "properties": {
+        "primary_layer": {
+          "type": "string",
+          "enum": [
+            "interaction",
+            "business_logic",
+            "data_access",
+            "configuration",
+            "infrastructure",
+            "cross_cutting"
+          ],
+          "description": "Architectural layer categorization based on primary responsibilities."
+        },
+        "layer_confidence_score": {
+          "type": "number",
+          "description": "Confidence score between 0.0 and 1.0 regarding architectural layer classification."
+        },
+        "entry_points": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Public interfaces, API endpoints, batch triggers, or CLI methods exposed by this module."
+        },
+        "state_management_pattern": {
+          "type": "string",
+          "enum": [
+            "stateless",
+            "stateful_in_memory",
+            "database_backed",
+            "session_bound",
+            "global_mutable_state"
+          ],
+          "description": "Mechanism used by the module to retain operational state across invocations."
+        }
+      }
+    },
+    "quality_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cyclomatic_complexity",
+        "maintainability_index",
+        "lines_of_code",
+        "comment_density_ratio",
+        "halstead_volume",
+        "composite_quality_score"
+      ],
+      "properties": {
+        "cyclomatic_complexity": {
+          "type": "integer",
+          "description": "Estimated control flow complexity based on linearly independent execution paths."
+        },
+        "maintainability_index": {
+          "type": "number",
+          "description": "Composite index scaled between 0 and 100 capturing maintainability derived from Halstead Volume, Cyclomatic Complexity, and LOC."
+        },
+        "lines_of_code": {
+          "type": "integer",
+          "description": "Total non-blank lines of code in the module."
+        },
+        "comment_density_ratio": {
+          "type": "number",
+          "description": "Ratio of comment lines relative to total non-blank lines of code (0.0 to 1.0)."
+        },
+        "halstead_volume": {
+          "type": "number",
+          "description": "Algorithmic complexity estimate based on distinct operators and operands."
+        },
+        "composite_quality_score": {
+          "type": "number",
+          "description": "Multi-objective weighted quality score calculated via combined MI, CC, and function length parameters."
+        }
+      }
+    },
+    "functional_requirements": {
+      "type": "array",
+      "description": "Comprehensive enumeration of functional requirements and business rules embedded in the source code.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "requirement_id",
+          "title",
+          "description",
+          "business_rule_type",
+          "source_line_range",
+          "input_parameters",
+          "output_artifacts"
+        ],
+        "properties": {
+          "requirement_id": {
+            "type": "string",
+            "description": "Unique identifier for the functional requirement (e.g., REQ-BL-001)."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short descriptive title of the functional requirement."
+          },
+          "description": {
+            "type": "string",
+            "description": "Detailed explanation of the business logic, formulas, or conditional processing rules."
+          },
+          "business_rule_type": {
+            "type": "string",
+            "enum": [
+              "computation",
+              "validation",
+              "data_transformation",
+              "workflow_routing",
+              "authorization",
+              "audit_logging"
+            ],
+            "description": "Classification of the extracted business rule."
+          },
+          "source_line_range": {
+            "type": "string",
+            "description": "Start and end line numbers where the business logic is defined (e.g., '102-145')."
+          },
+          "input_parameters": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Data structures, arguments, or environment variables consumed by this logic."
+          },
+          "output_artifacts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Return values, modified global states, or external messages generated by this logic."
+          }
+        }
+      }
+    },
+    "technical_debt_and_code_smells": {
+      "type": "array",
+      "description": "Identified structural deficiencies, anti-patterns, and deprecated dependencies.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "issue_id",
+          "category",
+          "severity",
+          "source_location",
+          "description",
+          "remediation_strategy"
+        ],
+        "properties": {
+          "issue_id": {
+            "type": "string",
+            "description": "Unique tracking code for the technical debt item (e.g., DEBT-SEC-004)."
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "deprecated_api",
+              "security_vulnerability",
+              "hardcoded_credentials",
+              "god_class_or_method",
+              "dead_code",
+              "tight_coupling",
+              "missing_error_handling",
+              "manual_deployment_dependency"
+            ],
+            "description": "Classification of the identified code smell or technical debt factor."
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "informational"
+            ],
+            "description": "Impact level on operational stability, maintainability, or security."
+          },
+          "source_location": {
+            "type": "string",
+            "description": "Specific symbol name or line range associated with the issue."
+          },
+          "description": {
+            "type": "string",
+            "description": "Detailed explanation of why the implementation constitutes technical debt."
+          },
+          "remediation_strategy": {
+            "type": "string",
+            "description": "Recommended refactoring technique or pattern to eliminate the defect."
+          }
+        }
+      }
+    },
+    "dependencies_and_integrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "internal_module_dependencies",
+        "external_library_dependencies",
+        "database_interactions",
+        "network_and_api_calls",
+        "integration_ceiling_risk"
+      ],
+      "properties": {
+        "internal_module_dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of internal project files, packages, or symbols referenced by this module."
+        },
+        "external_library_dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "library_name",
+              "version_constraint",
+              "is_deprecated",
+              "end_of_life_status"
+            ],
+            "properties": {
+              "library_name": {
+                "type": "string"
+              },
+              "version_constraint": {
+                "type": "string"
+              },
+              "is_deprecated": {
+                "type": "boolean"
+              },
+              "end_of_life_status": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Third-party libraries, packages, or vendor SDKs imported by this file."
+        },
+        "database_interactions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "operation_type",
+              "target_entity",
+              "execution_mechanism"
+            ],
+            "properties": {
+              "operation_type": {
+                "type": "string",
+                "enum": [
+                  "READ",
+                  "WRITE",
+                  "UPDATE",
+                  "DELETE",
+                  "SCHEMA_DDL",
+                  "STORED_PROCEDURE_EXEC"
+                ]
+              },
+              "target_entity": {
+                "type": "string"
+              },
+              "execution_mechanism": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Data access patterns, embedded SQL queries, or ORM calls executed by the code."
+        },
+        "network_and_api_calls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "External HTTP, RPC, message queue, or socket calls originating from this file."
+        },
+        "integration_ceiling_risk": {
+          "type": "boolean",
+          "description": "Flags whether legacy architectural constraints prevent modern API exposure without custom middleware."
+        }
+      }
+    },
+    "security_findings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authn_authz_checks",
+        "secret_or_credential_usage",
+        "pii_handling",
+        "injection_risk",
+        "audit_logging_behavior"
+      ],
+      "properties": {
+        "authn_authz_checks": {
+          "type": "string",
+          "description": "Description of authentication and authorization controls implemented in the code."
+        },
+        "secret_or_credential_usage": {
+          "type": "string",
+          "description": "Whether credentials or secrets are hardcoded, externalized, or encrypted."
+        },
+        "pii_handling": {
+          "type": "string",
+          "description": "How personally identifiable or sensitive data is processed, logged, or stored."
+        },
+        "injection_risk": {
+          "type": "string",
+          "description": "Assessment of injection exposure such as SQL, command, or shell injection risk."
+        },
+        "audit_logging_behavior": {
+          "type": "string",
+          "description": "Whether the module records audit activity for privileged or business-critical operations."
+        }
+      }
+    },
+    "data_lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tables_and_entities",
+        "join_and_relationship_usage",
+        "transaction_boundaries",
+        "file_or_message_io",
+        "data_classification"
+      ],
+      "properties": {
+        "tables_and_entities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Database tables, files, or entities read, written, or transformed by the module."
+        },
+        "join_and_relationship_usage": {
+          "type": "string",
+          "description": "How key relationships, joins, or mapping logic are handled across data sources."
+        },
+        "transaction_boundaries": {
+          "type": "string",
+          "description": "Description of commit, rollback, locking, or database transaction behavior."
+        },
+        "file_or_message_io": {
+          "type": "string",
+          "description": "Description of file reads, writes, queue usage, or message exchange performed by the code."
+        },
+        "data_classification": {
+          "type": "string",
+          "description": "Classification of the data the module handles, including sensitivity or business criticality."
+        }
+      }
+    },
+    "exception_handling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exception_types_handled",
+        "retry_policy",
+        "timeout_behavior",
+        "rollback_behavior",
+        "logging_and_alerting"
+      ],
+      "properties": {
+        "exception_types_handled": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Exception or failure conditions explicitly handled by the module."
+        },
+        "retry_policy": {
+          "type": "string",
+          "description": "Retry logic used for transient failures or remote operations."
+        },
+        "timeout_behavior": {
+          "type": "string",
+          "description": "How timeouts or long-running operations are managed."
+        },
+        "rollback_behavior": {
+          "type": "string",
+          "description": "Behavior when partial execution or persistence fails."
+        },
+        "logging_and_alerting": {
+          "type": "string",
+          "description": "How the module logs failures and signals operational issues."
+        }
+      }
+    },
+    "test_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_test_coverage",
+        "integration_test_coverage",
+        "regression_test_status",
+        "manual_validation_steps",
+        "known_issues"
+      ],
+      "properties": {
+        "unit_test_coverage": {
+          "type": "string",
+          "description": "Assessment of unit test coverage or absence of tests for the module."
+        },
+        "integration_test_coverage": {
+          "type": "string",
+          "description": "Description of end-to-end or integration verification for the module."
+        },
+        "regression_test_status": {
+          "type": "string",
+          "description": "Whether regression tests exist and whether they are known to pass or fail."
+        },
+        "manual_validation_steps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Manual checks or scenarios used to validate behavior."
+        },
+        "known_issues": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Known defects, assumptions, or gaps affecting verification confidence."
+        }
+      }
+    },
+    "business_impact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "business_process_owner",
+        "criticality_level",
+        "sla_or_availability_tolerance",
+        "regulatory_constraints",
+        "operational_risk"
+      ],
+      "properties": {
+        "business_process_owner": {
+          "type": "string",
+          "description": "Business area or functional owner impacted by this module."
+        },
+        "criticality_level": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "description": "Business importance of the module to operational continuity."
+        },
+        "sla_or_availability_tolerance": {
+          "type": "string",
+          "description": "Service availability, downtime tolerance, or SLA expectations for this module."
+        },
+        "regulatory_constraints": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Regulations or policies relevant to the module's operation."
+        },
+        "operational_risk": {
+          "type": "string",
+          "description": "Impact if the module fails, degrades, or is not migrated safely."
+        }
+      }
+    },
+    "iso_25010_attributes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "functional_suitability",
+        "performance_efficiency",
+        "compatibility",
+        "usability",
+        "reliability",
+        "security",
+        "maintainability",
+        "portability"
+      ],
+      "properties": {
+        "functional_suitability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        },
+        "performance_efficiency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        },
+        "compatibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        },
+        "usability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        },
+        "reliability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        },
+        "security": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        },
+        "maintainability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        },
+        "portability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "findings"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "description": "Rating from 1.0 to 5.0."
+            },
+            "findings": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "modernization_recommendations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "recommended_7r_strategy",
+        "target_architecture_pattern",
+        "refactoring_complexity_level",
+        "estimated_person_hours",
+        "strangler_fig_suitability",
+        "target_technology_stack",
+        "step_by_step_migration_plan"
+      ],
+      "properties": {
+        "recommended_7r_strategy": {
+          "type": "string",
+          "enum": [
+            "Rehost",
+            "Replatform",
+            "Refactor",
+            "Rearchitect",
+            "Rebuild",
+            "Retire",
+            "Retain"
+          ],
+          "description": "Optimal modernization pathway defined under the standard 7Rs migration taxonomy."
+        },
+        "target_architecture_pattern": {
+          "type": "string",
+          "enum": [
+            "microservice",
+            "event_driven_module",
+            "serverless_function",
+            "modular_monolith_component",
+            "batch_job"
+          ],
+          "description": "Destination architectural pattern for modern code generation."
+        },
+        "refactoring_complexity_level": {
+          "type": "string",
+          "enum": [
+            "trivial",
+            "moderate",
+            "complex",
+            "extreme_risk"
+          ],
+          "description": "Subjective operational risk associated with migrating this module."
+        },
+        "estimated_person_hours": {
+          "type": "number",
+          "description": "Estimated engineering effort required to modernize and validate this module."
+        },
+        "strangler_fig_suitability": {
+          "type": "boolean",
+          "description": "Indicates whether the module can be incrementally intercepted and replaced using the Strangler Fig pattern."
+        },
+        "target_technology_stack": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Recommended language runtimes, frameworks, and libraries for the modern target implementation."
+        },
+        "step_by_step_migration_plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ordered sequence of engineering actions required to migrate this module safely."
+        }
+      }
+    },
+    "token_usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_total_tokens",
+        "run_total_elapsed_seconds",
+        "agents"
+      ],
+      "properties": {
+        "run_total_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total token count consumed for this module analysis run."
+        },
+        "run_total_elapsed_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Total wall-clock elapsed time in seconds summed across all agents for this run."
+        },
+        "agents": {
+          "type": "object",
+          "description": "Per-agent token usage keyed by agent name.",
+          "patternProperties": {
+            "^.+$": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "model_name",
+                "started_at",
+                "ended_at",
+                "elapsed_seconds",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens"
+              ],
+              "properties": {
+                "model_name": {
+                  "type": "string",
+                  "description": "Model identifier that executed the work for this agent."
+                },
+                "started_at": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "ISO 8601 timestamp when this agent began processing."
+                },
+                "ended_at": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "ISO 8601 timestamp when this agent finished processing."
+                },
+                "elapsed_seconds": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Elapsed wall-clock time in seconds between started_at and ended_at."
+                },
+                "prompt_tokens": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Prompt tokens submitted for this agent during this run."
+                },
+                "completion_tokens": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Completion tokens returned by this agent during this run."
+                },
+                "total_tokens": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Combined prompt and completion tokens for this agent during this run."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

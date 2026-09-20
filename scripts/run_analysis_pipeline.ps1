@@ -1,0 +1,1258 @@
+# Drives the 9-skill legacy-source analysis pipeline (skills/*) against the
+# queue built by generate_analysis_queue.ps1, calling a local Ollama model
+# directly (OpenAI-compatible /v1/chat/completions) for each stage. Progress,
+# per-agent token usage, and resume position are persisted in each file's
+# .analysis-state/states/*.state.json record after every stage, so a run can
+# be interrupted and continued without redoing completed stages.
+#
+# IMPORTANT SCHEMA NOTE: templates/source-code-analysis-schema.json requires
+# several array-of-OBJECT fields (functional_requirements[], etc.). Grammar-
+# constrained structured output on a local model reliably hangs on nested
+# array-of-objects (this is why the old run_legacy_doc.ps1 flattened its own
+# output schema). This script asks the final "architecture_spec_writer"
+# stage for the same conceptual sections but with those specific fields
+# flattened to descriptive strings, and parses the result as plain JSON
+# (no response_format/grammar constraint) so a slow/failed grammar compile
+# can't hang the call. See $ArchitectureSpecSystemPrompt below for the exact
+# shape produced.
+#
+# Usage:
+#   .\run_analysis_pipeline.ps1                      # process 1 queued file
+#   .\run_analysis_pipeline.ps1 -Limit 5             # process up to 5 files
+#   .\run_analysis_pipeline.ps1 -Limit 0             # process the entire remaining queue
+#   .\run_analysis_pipeline.ps1 -DryRun              # show what would be picked, call nothing
+#   .\run_analysis_pipeline.ps1 -Model "qwen2.5-coder:32b"
+#
+#   Running multiple workers in parallel against the same queue, one per
+#   GPU: Ollama pins a whole server *process* to a GPU via CUDA_VISIBLE_
+#   DEVICES at launch (unlike LM Studio, which can't guarantee physical GPU
+#   placement per model identifier), so each worker needs its own port and
+#   CUDA device. Give each instance the same -WorkerCount and a distinct
+#   0-based -WorkerIndex so they partition the eligible files instead of
+#   racing to pick up the same ones. Two terminals:
+#     .\run_analysis_pipeline.ps1 -Limit 0 -OllamaUrl http://127.0.0.1:11435/v1 -CudaVisibleDevices 1 -WorkerIndex 0 -WorkerCount 2
+#     .\run_analysis_pipeline.ps1 -Limit 0 -OllamaUrl http://127.0.0.1:11436/v1 -CudaVisibleDevices 0 -WorkerIndex 1 -WorkerCount 2
+#   (run_analysis_pipeline_parallel.ps1 does this automatically.)
+
+param(
+    [int]$Limit = 1,
+    [string]$OllamaUrl = "http://localhost:11434/v1",
+    [string]$Model = "llama3.1:8b",
+    [double]$Temperature = 0.2,
+    [int]$MaxTokensPerStage = 0,
+    [int]$TimeoutSec = 86400,
+    [int]$MaxContentChars = 0,
+    [int]$MaxFinalContextChars = 160000,
+    [switch]$DryRun,
+    # Run several instances of this script at once against the same queue,
+    # one per available model/GPU: give each instance the same -WorkerCount
+    # and a distinct -WorkerIndex (0-based) so they partition the eligible
+    # files instead of racing to pick up the same ones.
+    [int]$WorkerIndex = 0,
+    [int]$WorkerCount = 1,
+    # Stall guard: a file's total budget is StallMultiplier times this
+    # worker's own average seconds/file (falling back to the queue-wide
+    # average, then BootstrapFileSeconds, until this worker has completed
+    # at least one file itself). Exceeding that budget mid-file is treated
+    # as a stall: the model is unloaded via `ollama stop` (it lazy-loads
+    # again on the next request) and the file is retried once with
+    # StallRetryMarginSeconds of extra budget. A second stall on the same
+    # file gives up and blocks it as usual.
+    [double]$StallMultiplier = 4.0,
+    [int]$StallRetryMarginSeconds = 300,
+    [int]$MinStageTimeoutSeconds = 30,
+    [double]$BootstrapFileSeconds = 300,
+    # Recovery for when Ollama itself stops answering mid-call (its process
+    # crashed or reset the connection -- e.g. "Ollama HTTP 500 ... forcibly
+    # closed"), as opposed to this worker's own stall-budget timing out.
+    # Rather than blocking the file after one failure, wait this long for
+    # Ollama to settle, restart the instance/model, and retry -- up to
+    # -OllamaDownMaxRetries times before finally giving up and blocking.
+    [int]$OllamaDownWaitSeconds = 300,
+    [int]$OllamaDownMaxRetries = 12,
+    # If -OllamaUrl isn't reachable, start a dedicated `ollama serve`
+    # instance for it and pre-warm -Model before giving up.
+    # -CudaVisibleDevices empty means "don't manage GPU pinning, assume
+    # whatever's already running on this port" (manual/standalone use).
+    [switch]$NoAutoStart,
+    [string]$CudaVisibleDevices = "",
+    [string]$OllamaModelsPath = "E:\ollama\models",
+    # While a stage's Ollama call is in flight, print a "... still
+    # working (Ns)" line via Log every this-many seconds, so a long stage
+    # doesn't look indistinguishable from a hung one.
+    [int]$HeartbeatSeconds = 5
+)
+
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+$Root = Split-Path -Parent $PSScriptRoot
+$StateRoot = Join-Path $Root ".analysis-state"
+$QueueDir = Join-Path $StateRoot "queue"
+$CheckpointsDir = Join-Path $StateRoot "checkpoints"
+$OutputsDir = Join-Path $StateRoot "outputs"
+$StatesDir = Join-Path $StateRoot "states"
+$StatesDoneDir = Join-Path $StatesDir "done"
+$StatesBlockedDir = Join-Path $StatesDir "blocked"
+$ManifestPath = Join-Path $QueueDir "manifest.json"
+$LocksDir = Join-Path $StateRoot "locks"
+
+# Register this run so reset_analysis_state.ps1 can find and stop it before
+# wiping .analysis-state out from under a still-running process. One lock
+# file per PID -- in parallel mode each worker is its own process with its
+# own lock; the orchestrator itself needs none since killing its workers
+# makes its polling loop exit on its own.
+if (-not (Test-Path -LiteralPath $LocksDir)) { New-Item -ItemType Directory -Path $LocksDir -Force | Out-Null }
+$LockFilePath = Join-Path $LocksDir "$PID.lock"
+@{
+    pid          = $PID
+    script       = "run_analysis_pipeline.ps1"
+    worker_index = $WorkerIndex
+    worker_count = $WorkerCount
+    started_at   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+} | ConvertTo-Json | Set-Content -LiteralPath $LockFilePath -Encoding UTF8
+
+# Cross-process lock guarding Save-Manifest's read-modify-write of the
+# shared manifest.json. Without this, two worker processes finishing files
+# around the same moment can race: process B reads the on-disk manifest
+# before process A's write lands, then B writes its own (older) snapshot
+# back, silently reverting A's already-persisted update (e.g. a state_file
+# field that A had just repointed at states/blocked/ or states/done/ after
+# moving the physical record there) even though B never touched that entry.
+# Confirmed in practice: several manifest entries pointed at a state_file
+# path that no longer existed because the physical file had already been
+# relocated -- the move happened, but the manifest write recording it was
+# clobbered by a concurrently-running worker's own save. Scoped per-user
+# (no "Global\" prefix) since all workers run in the same interactive
+# session.
+$script:ManifestMutex = New-Object System.Threading.Mutex($false, "AnalysisPipelineManifestLock")
+
+# Order matters: this is the actual execution chain. Index 0
+# (file_queue_orchestrator_agent) is this script itself, not an LLM stage.
+$StageAgents = @(
+    "sanitizer_context_ingestion_agent",
+    "business_domain_extractor",
+    "source_ast_structural_mapper",
+    "business_logic_extractor",
+    "security_compliance_analyst",
+    "performance_scalability_analyst",
+    "test_validation_analyst",
+    "diagram_designer_context_visualizer",
+    "architecture_spec_writer"
+)
+
+# Tag every printed line with which worker wrote it. This is done at the
+# source (not left to the parallel orchestrator's job-output prefixing)
+# because when two workers' raw console output interleaves -- whether via
+# Start-Job streaming or two terminals sharing one window -- lines from
+# different workers can otherwise land next to each other with no way to
+# tell them apart.
+$WorkerTag = if ($WorkerCount -gt 1) { "[Worker $($WorkerIndex + 1)] " } else { "" }
+
+# One consistent color per worker (cycling if there are ever more workers
+# than colors), so interleaved output from multiple workers is visually
+# separable at a glance instead of just by reading the [Worker N] text.
+# Red stays reserved for genuine errors/BLOCKED lines regardless of which
+# worker printed them -- that signal is more useful staying consistent than
+# blending into a per-worker color.
+$WorkerColorPalette = @("Cyan", "Yellow", "Magenta", "Green", "Blue", "DarkCyan", "DarkYellow", "DarkMagenta")
+$WorkerLogColor = if ($WorkerCount -gt 1) { $WorkerColorPalette[$WorkerIndex % $WorkerColorPalette.Count] } else { "White" }
+
+# Per-process (this worker's own) rolling average of completed-file seconds,
+# used by Get-EstimatedFileSeconds for the stall guard's "par processus"
+# budget -- a worker's own recent throughput is a better predictor of its
+# next file than a global average across every worker/model.
+$script:WorkerFileSecondsHistory = New-Object System.Collections.Generic.List[double]
+
+function Log {
+    param([string]$Text, [string]$Color = "White")
+    $effectiveColor = if ($Color -eq "Red") { "Red" } else { $WorkerLogColor }
+    Write-Host "$WorkerTag$Text" -ForegroundColor $effectiveColor
+}
+
+# ---------------- System prompts, one per skill in skills/ ----------------
+
+$SanitizerSystemPrompt = @'
+You are the Sanitizer & Context Ingestion Agent for a legacy modernization pipeline (COBOL, Ingres 4GL/OSQ, report-writer, DCL, PHP, shell, embedded-SQL C). You receive raw legacy source and, optionally, a related SQL schema (DDL). Your job:
+1. Strip boilerplate: copyright/license headers, generated-code banners, redundant comment blocks, pure noise.
+2. Preserve all functionally meaningful code, comments explaining business intent, and every SQL/database statement verbatim.
+3. Identify every table/column reference and, if schema context is provided, append a brief inline note of that table's relevant columns and types.
+4. Do not invent schema definitions that were not provided.
+Output ONLY the resulting "Sanitised Code Context" as plain text: cleaned code annotated with schema notes. No preamble, no markdown fences, no summary.
+'@
+
+$BusinessDomainSystemPrompt = @'
+You are the Business Domain Extractor Agent. You receive a Sanitised Code Context. Your job:
+1. Identify the business area and core entities this module operates on.
+2. Map database tables and program sections to business objects, workflows, and lifecycle states.
+3. Summarize the operational rules, calculations, and validations that encode business policy, in plain language.
+4. Label anything not explicit in the code as a hypothesis rather than confirmed behavior.
+Output ONLY plain text under these labeled sections: BUSINESS AREA, CORE ENTITIES, WORKFLOW STEPS, POLICY RULES, AMBIGUITIES/HYPOTHESES. No markdown fences, no extra commentary.
+'@
+
+$StructuralMapperSystemPrompt = @'
+You are the Source AST & Structural Mapper Agent. You receive a Sanitised Code Context and a Business Domain summary. Your job:
+1. List every entry point (paragraph, procedure, section, function, screen, or script invocation) by name.
+2. Describe control-flow paths: sequence, branching (IF/GOTO/PERFORM/CALL), loops, and how entry points relate to each other.
+3. List every database operation (SELECT/INSERT/UPDATE/DELETE/DDL) with table, operation, and columns involved.
+4. List external dependencies: included copybooks/files, called programs, invoked scripts, network/API calls.
+5. Note any dead code, repeated patterns, or coupling hotspots relevant to migration risk.
+Output ONLY plain text under these labeled sections: ENTRY POINTS, CONTROL FLOW, DATABASE OPERATIONS, DEPENDENCIES, HOTSPOTS. No markdown fences, no extra commentary.
+'@
+
+$BusinessLogicSystemPrompt = @'
+You are the Business Logic Extractor Agent. You receive a Sanitised Code Context, a Structural Breakdown, and a Business Domain summary. Your job:
+1. Translate procedural constructs (GOTO, loops, status/return codes, conditionals) into step-by-step business rules.
+2. Document every calculation, formula, and data validation rule in plain language, preserving the exact meaning of status codes and flags.
+3. Identify dead code: branches, conditions, or procedures that appear unreachable or unused.
+4. Note edge cases, retries, default values, and exception-handling behavior.
+Output ONLY plain text under these labeled sections: BUSINESS RULES, VALIDATIONS, CALCULATIONS, DEAD CODE, EDGE CASES. No markdown fences, no extra commentary.
+'@
+
+$SecuritySystemPrompt = @'
+You are the Security & Compliance Analyst. You receive a Sanitised Code Context, a Structural Breakdown, and a Business Logic summary. Your job:
+1. Detect hardcoded credentials, secrets, or unsafe configuration patterns.
+2. Review authentication/authorization logic for missing or weak controls.
+3. Analyze how PII or sensitive data is stored, logged, or propagated.
+4. Identify SQL/command/file/API injection risk and unsafe shell usage.
+5. Check for audit logging on sensitive or regulated operations, and flag relevant compliance implications.
+Base every finding on code evidence; separate confirmed vulnerabilities from likely risks.
+Output ONLY plain text under these labeled sections: AUTHN/AUTHZ, SECRETS, PII HANDLING, INJECTION RISK, AUDIT LOGGING, COMPLIANCE NOTES. No markdown fences, no extra commentary.
+'@
+
+$PerformanceSystemPrompt = @'
+You are the Performance & Scalability Analyst. You receive a Structural Breakdown and a Business Logic summary. Your job:
+1. Identify expensive loops, nested processing, repeated database access, and blocking calls.
+2. Assess CPU/memory/I-O pressure and batch-processing bottlenecks.
+3. Estimate how the module behaves under growing transaction volume.
+4. Tie performance risks to concrete code patterns, not speculation.
+Output ONLY plain text under these labeled sections: HOTSPOTS, RESOURCE PATTERNS, SCALING CONSTRAINTS, MODERNIZATION IMPLICATIONS. No markdown fences, no extra commentary.
+'@
+
+$TestValidationSystemPrompt = @'
+You are the Test & Validation Analyst. You receive a Structural Breakdown and a Business Logic summary. Your job:
+1. Assess whether unit, integration, or regression tests appear to exist or are referenced for this module.
+2. Determine whether critical paths have any explicit validation evidence.
+3. Identify missing or weak verification around edge cases and failure paths.
+4. Catalog known issues, assumptions, and manual validation steps that would be needed before migration.
+Be explicit about confidence levels and missing proof; do not assume tests exist without evidence.
+Output ONLY plain text under these labeled sections: TEST COVERAGE, VALIDATION EVIDENCE, GAPS, KNOWN ISSUES, MIGRATION VERIFICATION NEEDED. No markdown fences, no extra commentary.
+'@
+
+$DiagramSystemPrompt = @'
+You are the Diagram Designer & Context Visualizer. You receive the Business Domain, Structural, Business Logic, Security, Performance, and Test Validation findings for one module. Your job:
+1. Produce a single Mermaid flowchart (flowchart TD) showing entry points, key procedures, data access, and dependencies.
+2. Mark decision branches, validation rules, and exceptional paths.
+3. Annotate critical technical-debt, security, or dependency hotspots directly on relevant nodes/edges as short labels.
+Keep it readable: summarize, do not enumerate every line of code.
+Output ONLY a single fenced Mermaid code block (```mermaid ... ```) and nothing else.
+'@
+
+# The one stage whose output is parsed as JSON. Array-of-object fields from
+# the full report schema are deliberately flattened to strings here (see
+# header comment) to avoid grammar-constrained decoding entirely -- this
+# call uses no response_format, just a plain-text JSON instruction, parsed
+# and validated by this script afterward.
+$ArchitectureSpecSystemPrompt = @'
+You are the Architecture & Spec Writer Agent, the final synthesis step of a legacy modernization pipeline. You receive: the file path, and the prior findings from the Business Domain, Structural, Business Logic, Security, Performance, and Test Validation agents for one legacy source module. Compile them into a single JSON object with EXACTLY this shape (all fields required; use empty string/array/false if genuinely unknown, never omit a key):
+
+{
+  "module_metadata": {"file_path": "", "programming_language": "", "language_version": "", "module_scope": "file|class|package|procedure|module|script", "primary_purpose": ""},
+  "architectural_layer": {"primary_layer": "interaction|business_logic|data_access|configuration|infrastructure|cross_cutting", "layer_confidence_score": 0.0, "entry_points": [""], "state_management_pattern": "stateless|stateful_in_memory|database_backed|session_bound|global_mutable_state"},
+  "quality_metrics": {"cyclomatic_complexity": 0, "maintainability_index": 0.0, "lines_of_code": 0, "comment_density_ratio": 0.0, "halstead_volume": 0.0, "composite_quality_score": 0.0},
+  "functional_requirements": ["REQ-ID | title | computation|validation|data_transformation|workflow_routing|authorization|audit_logging | line-range | short description"],
+  "technical_debt_and_code_smells": ["ISSUE-ID | deprecated_api|security_vulnerability|hardcoded_credentials|god_class_or_method|dead_code|tight_coupling|missing_error_handling|manual_deployment_dependency | critical|high|medium|low|informational | location | description | remediation"],
+  "dependencies_and_integrations": {"internal_module_dependencies": [""], "external_library_dependencies": ["name | version | deprecated(true/false) | eol status"], "database_interactions": ["TABLE | READ|WRITE|UPDATE|DELETE|SCHEMA_DDL|STORED_PROCEDURE_EXEC | mechanism"], "network_and_api_calls": [""], "integration_ceiling_risk": false},
+  "security_findings": {"authn_authz_checks": "", "secret_or_credential_usage": "", "pii_handling": "", "injection_risk": "", "audit_logging_behavior": ""},
+  "data_lineage": {"tables_and_entities": [""], "join_and_relationship_usage": "", "transaction_boundaries": "", "file_or_message_io": "", "data_classification": ""},
+  "exception_handling": {"exception_types_handled": [""], "retry_policy": "", "timeout_behavior": "", "rollback_behavior": "", "logging_and_alerting": ""},
+  "test_status": {"unit_test_coverage": "", "integration_test_coverage": "", "regression_test_status": "", "manual_validation_steps": [""], "known_issues": [""]},
+  "business_impact": {"business_process_owner": "", "criticality_level": "low|medium|high|critical", "sla_or_availability_tolerance": "", "regulatory_constraints": [""], "operational_risk": ""},
+  "iso_25010_attributes": {
+    "functional_suitability": {"score": 0.0, "findings": ""}, "performance_efficiency": {"score": 0.0, "findings": ""},
+    "compatibility": {"score": 0.0, "findings": ""}, "usability": {"score": 0.0, "findings": ""},
+    "reliability": {"score": 0.0, "findings": ""}, "security": {"score": 0.0, "findings": ""},
+    "maintainability": {"score": 0.0, "findings": ""}, "portability": {"score": 0.0, "findings": ""}
+  },
+  "modernization_recommendations": {"recommended_7r_strategy": "Rehost|Replatform|Refactor|Rearchitect|Rebuild|Retire|Retain", "target_architecture_pattern": "microservice|event_driven_module|serverless_function|modular_monolith_component|batch_job", "refactoring_complexity_level": "trivial|moderate|complex|extreme_risk", "estimated_person_hours": 0, "strangler_fig_suitability": false, "target_technology_stack": [""], "step_by_step_migration_plan": [""]},
+  "markdown_report": ""
+}
+
+"markdown_report" must be a complete Markdown document (escaped as a JSON string) covering all sections above, suitable to hand to a developer. Return ONLY the JSON object, no prose outside it, no markdown fences.
+'@
+
+# ---------------- Ollama plumbing ----------------
+
+function Test-OllamaServerUp {
+    param([string]$BaseUrl)
+    try {
+        $base = $BaseUrl -replace '/v1/?$', ''
+        Invoke-RestMethod -Method Get -Uri "$base/api/tags" -TimeoutSec 5 | Out-Null
+        return $true
+    }
+    catch { return $false }
+}
+
+# Distinguishes "Ollama itself stopped answering" (its server process
+# crashed, or the model runner reset the connection mid-request) from an
+# ordinary application-level failure (bad JSON, our own stall-budget
+# timeout, etc.). The stall guard's $isStall check doesn't catch this case --
+# a crashed connection typically fails in milliseconds, nowhere near this
+# call's own timeout/budget -- so it needs its own detection to trigger the
+# wait-and-restart recovery instead of blocking the file after one failure.
+function Test-IsTransientOllamaError {
+    param([string]$Message)
+    if (-not $Message) { return $false }
+    return $Message -match 'forcibly closed|wsarecv|Unable to connect to the remote server|actively refused|connection was closed|Ollama HTTP 5\d\d|error was encountered while running the model|underlying connection was closed|No connection could be made'
+}
+
+# With $ErrorActionPreference = "Stop" (set at script scope), a native exe's
+# stderr output -- even ollama's own benign status/success text -- becomes a
+# terminating PowerShell error the moment PowerShell turns it into a
+# NativeCommandError, REGARDLESS of where the stream is redirected (*> $null
+# does not prevent this in Windows PowerShell 5.1 -- confirmed by hitting
+# this exact crash, first with the lms CLI and again with ollama). What
+# actually matters is $ErrorActionPreference at the time the native command
+# runs, so this locally overrides it to "SilentlyContinue" for the call and
+# restores it afterward; success/failure is read from $LASTEXITCODE, not
+# the streams.
+function Invoke-OllamaCommand {
+    param([string[]]$ArgList)
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        & ollama @ArgList *> $null
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+    return $LASTEXITCODE
+}
+
+# Ensures a dedicated Ollama instance is up at -OllamaUrl, starting one if
+# needed, then pre-warms -Model so its cold-load latency happens here
+# instead of eating into the stall guard's budget for the first real file.
+# CudaVisibleDevices empty = don't manage GPU pinning at all (assume
+# whatever's already listening on this port, for manual/standalone use).
+function Start-OllamaInstanceIfNeeded {
+    param([string]$BaseUrl, [string]$CudaDevice, [string]$ModelsPath, [string]$ModelKey, [int]$TimeoutSeconds = 60)
+    if (-not (Test-OllamaServerUp -BaseUrl $BaseUrl)) {
+        $bareHost = $BaseUrl -replace '^https?://', '' -replace '/v1/?$', ''
+        Log "Ollama instance not reachable at $BaseUrl -- starting one (CUDA_VISIBLE_DEVICES=$CudaDevice) ..." "Yellow"
+        $prevCuda = $env:CUDA_VISIBLE_DEVICES
+        $prevHost = $env:OLLAMA_HOST
+        $prevModels = $env:OLLAMA_MODELS
+        try {
+            if ($CudaDevice) { $env:CUDA_VISIBLE_DEVICES = $CudaDevice }
+            $env:OLLAMA_HOST = $bareHost
+            if ($ModelsPath) { $env:OLLAMA_MODELS = $ModelsPath }
+            Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden | Out-Null
+        }
+        finally {
+            # Env vars are only used to seed the new process at launch --
+            # clear them from this session right away so they don't leak
+            # into anything else this worker does afterward (proven pattern
+            # from live testing: Start-Process children inherit the parent's
+            # env at spawn time, so this is safe to clear immediately after).
+            if ($null -eq $prevCuda) { Remove-Item Env:\CUDA_VISIBLE_DEVICES -ErrorAction SilentlyContinue } else { $env:CUDA_VISIBLE_DEVICES = $prevCuda }
+            if ($null -eq $prevHost) { Remove-Item Env:\OLLAMA_HOST -ErrorAction SilentlyContinue } else { $env:OLLAMA_HOST = $prevHost }
+            if ($null -eq $prevModels) { Remove-Item Env:\OLLAMA_MODELS -ErrorAction SilentlyContinue } else { $env:OLLAMA_MODELS = $prevModels }
+        }
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-OllamaServerUp -BaseUrl $BaseUrl) { break }
+            Start-Sleep -Seconds 2
+        }
+        if (-not (Test-OllamaServerUp -BaseUrl $BaseUrl)) {
+            throw "Ollama instance did not come up at $BaseUrl after starting it."
+        }
+    }
+    Log "Pre-warming '$ModelKey' on $BaseUrl ..." "Yellow"
+    $bareBase = $BaseUrl -replace '/v1/?$', ''
+    try {
+        Invoke-RestMethod -Method Post -Uri "$bareBase/api/generate" -TimeoutSec 300 -ContentType "application/json" `
+            -Body (@{ model = $ModelKey; prompt = "hi"; stream = $false } | ConvertTo-Json) | Out-Null
+    }
+    catch {
+        Log "  pre-warm request failed (continuing anyway, first real stage call will retry the load): $($_.Exception.Message)" "Red"
+    }
+}
+
+function Invoke-OllamaChat {
+    param(
+        [Parameter(Mandatory = $true)][string]$SystemPrompt,
+        [Parameter(Mandatory = $true)][string]$UserContent,
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][string]$ModelName,
+        [double]$Temp = 0.2,
+        [int]$MaxTokens = 0,
+        [int]$Timeout = 300,
+        # Printed via Log (so it already gets the [Worker N] prefix) every
+        # HeartbeatSeconds while this call is in flight, so a long-running
+        # stage doesn't look indistinguishable from a hung one. Empty string
+        # disables heartbeats.
+        [string]$HeartbeatLabel = "",
+        [int]$HeartbeatSeconds = 5
+    )
+    $body = @{
+        model       = $ModelName
+        messages    = @(
+            @{ role = "system"; content = $SystemPrompt }
+            @{ role = "user"; content = $UserContent }
+        )
+        temperature = $Temp
+        stream      = $false
+    }
+    if ($MaxTokens -gt 0) { $body.max_tokens = $MaxTokens }
+    $json = $body | ConvertTo-Json -Depth 10
+
+    # A plain Invoke-RestMethod call blocks this thread for the whole
+    # duration with no way to print in between. Using HttpClient directly
+    # lets the call run async while this thread polls Task.Wait() on a
+    # short interval and prints a heartbeat each time it's not done yet --
+    # the timeout behavior (abort after $Timeout seconds) is preserved via
+    # the CancellationTokenSource instead of -TimeoutSec.
+    $client = [System.Net.Http.HttpClient]::new()
+    $cts = [System.Threading.CancellationTokenSource]::new()
+    try {
+        $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
+        $cts.CancelAfter([TimeSpan]::FromSeconds($Timeout))
+        $content = [System.Net.Http.StringContent]::new($json, [System.Text.Encoding]::UTF8, "application/json")
+        $task = $client.PostAsync("$BaseUrl/chat/completions", $content, $cts.Token)
+
+        $elapsed = 0
+        try {
+            while (-not $task.Wait($HeartbeatSeconds * 1000)) {
+                $elapsed += $HeartbeatSeconds
+                if ($HeartbeatLabel) { Log "$HeartbeatLabel ... still working (${elapsed}s)" "DarkGray" }
+            }
+        }
+        catch {
+            # Task.Wait() doesn't just return $false on timeout the way a
+            # plain polling loop would -- once the task itself transitions to
+            # Canceled/Faulted (e.g. our own CancelAfter() firing while Wait()
+            # is blocked), Wait() throws immediately instead. The task's own
+            # IsFaulted/IsCanceled below still correctly reflect why, so just
+            # fall through to those instead of letting this exception surface
+            # as an opaque "One or more errors occurred." (confirmed via a
+            # local test: this is exactly what happened without this catch).
+        }
+
+        if ($task.IsFaulted) {
+            $inner = $task.Exception.InnerException
+            throw ($(if ($inner) { $inner.Message } else { $task.Exception.Message }))
+        }
+        if ($task.IsCanceled) {
+            throw "Request timed out after ${Timeout}s"
+        }
+        $response = $task.Result
+        $bodyText = $response.Content.ReadAsStringAsync().Result
+        if (-not $response.IsSuccessStatusCode) {
+            throw "Ollama HTTP $([int]$response.StatusCode): $bodyText"
+        }
+    }
+    finally {
+        $cts.Dispose()
+        $client.Dispose()
+    }
+
+    $parsed = $bodyText | ConvertFrom-Json
+    $choice = $parsed.choices[0]
+    return [PSCustomObject]@{
+        Content      = $choice.message.content
+        FinishReason = $choice.finish_reason
+        Usage        = $parsed.usage
+    }
+}
+
+# Stall recovery: unload this worker's own model on its own dedicated
+# instance only (never touches other workers' instances) via `ollama stop`,
+# targeted at this instance through $env:OLLAMA_HOST. No reload step is
+# needed -- unlike LM Studio's lms load/unload, Ollama lazy-loads the model
+# again automatically on the very next request, which is the retried stage
+# call right after this returns.
+function Restart-OllamaInstance {
+    param([string]$BaseUrl, [string]$ModelKey)
+    if (-not (Test-OllamaServerUp -BaseUrl $BaseUrl)) {
+        # The server process itself is gone (crashed), not just the model
+        # runner -- `ollama stop` has no process to talk to. Relaunch the
+        # whole instance the same way Start-OllamaInstanceIfNeeded does at
+        # startup, using this same worker's own CUDA device / models path.
+        Log "    [recovery] Ollama server at $BaseUrl is unreachable -- relaunching the instance" "Yellow"
+        Start-OllamaInstanceIfNeeded -BaseUrl $BaseUrl -CudaDevice $CudaVisibleDevices -ModelsPath $OllamaModelsPath -ModelKey $ModelKey | Out-Null
+        return $true
+    }
+    $bareHost = $BaseUrl -replace '^https?://', '' -replace '/v1/?$', ''
+    Log "    [recovery] stopping '$ModelKey' on $BaseUrl ..." "Yellow"
+    $prevHost = $env:OLLAMA_HOST
+    try {
+        $env:OLLAMA_HOST = $bareHost
+        $exitCode = Invoke-OllamaCommand -ArgList @("stop", $ModelKey)
+        if ($exitCode -ne 0) { Log "    [recovery] 'ollama stop' exited with code $exitCode (continuing anyway)" "Red" }
+    }
+    finally {
+        if ($null -eq $prevHost) { Remove-Item Env:\OLLAMA_HOST -ErrorAction SilentlyContinue } else { $env:OLLAMA_HOST = $prevHost }
+    }
+    Log "    [recovery] stopped -- it will lazy-load again on the retried request." "Yellow"
+    return $true
+}
+
+# ---------------- State / manifest helpers ----------------
+
+function Get-UtcNowStamp {
+    return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+}
+
+# Deterministic, non-negative hash of a file's own relative path, used to
+# assign it to exactly one worker (see the WorkerCount partitioning in Main).
+# Must depend only on the path string itself -- never on array position or
+# any other file's state -- so every worker computes the same owner for a
+# given file regardless of when it snapshotted the (concurrently mutating)
+# manifest. [string]::GetHashCode() is unsuitable here: .NET randomizes it
+# per-process by default, so it would disagree across worker processes.
+function Get-PathWorkerHash {
+    param([string]$RelativePath)
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($RelativePath)
+        $hashBytes = $sha1.ComputeHash($bytes)
+        return [System.BitConverter]::ToUInt32($hashBytes, 0)
+    }
+    finally {
+        $sha1.Dispose()
+    }
+}
+
+function Write-Utf8NoBom {
+    param([string]$Path, [string]$Content)
+    # Write-then-rename instead of an in-place WriteAllText: this file
+    # (manifest.json in particular) is read by other processes -- worker
+    # threads and queue_eta.ps1 -- with no lock on the read side. WriteAllText
+    # truncates the destination before writing, so a concurrent reader can
+    # catch it mid-write and get a torn/empty fragment (observed as
+    # "ConvertFrom-Json: Invalid JSON primitive: ."). File.Replace/Move is
+    # atomic on the same volume, so readers only ever see the old or the new
+    # complete content, never a partial one.
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $tempPath = "$Path.tmp-$PID"
+    [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
+    if (Test-Path -LiteralPath $Path) {
+        # File.Replace's 3-arg overload throws ArgumentException ("The path
+        # is not of a legal form") when $null is passed for the backup-file
+        # argument via PowerShell's method binding -- confirmed by testing
+        # the exact same call with a real path, which succeeds. A real
+        # (throwaway) backup path avoids the bug; it's deleted right after
+        # since the replace already landed by the time we get here.
+        $backupPath = "$Path.bak-$PID"
+        [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+        Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
+    }
+    else {
+        [System.IO.File]::Move($tempPath, $Path)
+    }
+}
+
+function Read-Manifest {
+    if (-not (Test-Path -LiteralPath $ManifestPath)) {
+        throw "No manifest found at $ManifestPath. Run generate_analysis_queue.ps1 first."
+    }
+    return Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+# Estimated seconds for one file, used as the stall guard's baseline
+# (the guard's actual budget is StallMultiplier times this). Prefers this
+# worker's own completed-file average from earlier in the current run (most
+# representative of "par processus" throughput); falls back to the
+# queue-wide average across all workers (same source queue_eta.ps1 uses)
+# once any files anywhere are completed; falls back to BootstrapFileSeconds
+# before any data exists at all.
+function Get-EstimatedFileSeconds {
+    if ($script:WorkerFileSecondsHistory.Count -gt 0) {
+        return ($script:WorkerFileSecondsHistory | Measure-Object -Average).Average
+    }
+    if (Test-Path -LiteralPath $ManifestPath) {
+        $m = Read-Manifest
+        $completed = @($m.files | Where-Object { $_.status -eq "completed" -and $_.token_usage.run_total_elapsed_seconds -gt 0 })
+        if ($completed.Count -gt 0) {
+            return ($completed | ForEach-Object { [double]$_.token_usage.run_total_elapsed_seconds } | Measure-Object -Average).Average
+        }
+    }
+    return $BootstrapFileSeconds
+}
+
+function Save-Manifest {
+    param($Manifest, [string]$UpdatedPath)
+    # With multiple worker processes sharing one manifest.json, a blind
+    # overwrite from this process's in-memory copy would clobber whatever the
+    # other worker(s) have written for the files they own since this copy was
+    # loaded. Re-read the current on-disk manifest and splice in only the one
+    # entry this call is reporting on, so concurrent workers never lose each
+    # other's progress. That read-then-write pair must itself be atomic
+    # across processes -- $script:ManifestMutex (acquired below) serializes
+    # it against every other worker's Save-Manifest call, closing the race
+    # where two workers' read-modify-write cycles interleave and the later
+    # write (based on a snapshot taken before the earlier write landed)
+    # silently reverts it.
+    $acquired = $false
+    try {
+        try {
+            $acquired = $script:ManifestMutex.WaitOne(60000)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # A previous holder exited without releasing (e.g. killed
+            # mid-write) -- .NET still grants this thread ownership when it
+            # throws this, so treat it as a normal acquisition rather than
+            # failing the save.
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            throw "Timed out waiting for the cross-process manifest lock."
+        }
+
+        $target = $Manifest
+        if ($UpdatedPath -and (Test-Path -LiteralPath $ManifestPath)) {
+            $current = Read-Manifest
+            $src = $Manifest.files | Where-Object { $_.path -eq $UpdatedPath } | Select-Object -First 1
+            if ($src) {
+                for ($i = 0; $i -lt $current.files.Count; $i++) {
+                    if ($current.files[$i].path -eq $UpdatedPath) { $current.files[$i] = $src; break }
+                }
+            }
+            $target = $current
+        }
+        $json = $target | ConvertTo-Json -Depth 15
+        Write-Utf8NoBom -Path $ManifestPath -Content ($json + "`n")
+    }
+    finally {
+        if ($acquired) { $script:ManifestMutex.ReleaseMutex() }
+    }
+}
+
+function Get-StatePath {
+    param([string]$StateFileRelative)
+    return Join-Path $Root ($StateFileRelative -replace '/', '\')
+}
+
+function Read-State {
+    param([string]$StateFileRelative)
+    $path = Get-StatePath $StateFileRelative
+    return Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+function Save-State {
+    param([string]$StateFileRelative, $State)
+    $path = Get-StatePath $StateFileRelative
+    $json = $State | ConvertTo-Json -Depth 12
+    Write-Utf8NoBom -Path $path -Content ($json + "`n")
+}
+
+# Relocates a file's state record out of states/ into a status-specific
+# subfolder (done/ or blocked/), so the working states/ folder only shows
+# files still in flight. Updates $Entry.state_file in place (same object as
+# in $Manifest.files) so the manifest persists the new location. No-ops if
+# the record already lives in the destination folder (e.g. a blocked file
+# that fails again on retry).
+function Move-StateFileToFolder {
+    param($Entry, [string]$StateFileRelative, [string]$DestDir, [string]$DestFolderName)
+    $sourcePath = Get-StatePath $StateFileRelative
+    if ((Split-Path -Parent $sourcePath) -ieq $DestDir) { return $StateFileRelative }
+    if (-not (Test-Path -LiteralPath $DestDir)) { New-Item -ItemType Directory -Path $DestDir -Force | Out-Null }
+    $leaf = Split-Path -Leaf $StateFileRelative
+    $destPath = Join-Path $DestDir $leaf
+    Move-Item -LiteralPath $sourcePath -Destination $destPath -Force
+    $newRelative = ".analysis-state/states/$DestFolderName/$leaf"
+    $Entry.state_file = $newRelative
+    return $newRelative
+}
+
+function Move-CompletedStateFile {
+    param($Entry, [string]$StateFileRelative)
+    return Move-StateFileToFolder -Entry $Entry -StateFileRelative $StateFileRelative -DestDir $StatesDoneDir -DestFolderName "done"
+}
+
+function Move-BlockedStateFile {
+    param($Entry, [string]$StateFileRelative)
+    return Move-StateFileToFolder -Entry $Entry -StateFileRelative $StateFileRelative -DestDir $StatesBlockedDir -DestFolderName "blocked"
+}
+
+function Remove-CodeFence {
+    # Local models frequently wrap output in ```json / ```mermaid fences even
+    # when told not to, and often preface it with prose ("Here is the JSON
+    # object with the compiled findings:") that the old ^-anchored regex
+    # didn't tolerate -- that preface made the whole match fail, so the raw
+    # "Here is the JSON..." text fell through untouched and ConvertFrom-Json
+    # choked on "Here" as an invalid primitive (confirmed as the dominant
+    # architecture_spec_writer blocker across the queue). Matching the fence
+    # anywhere in the text -- not just at the very start/end -- strips that
+    # preface along with the fence.
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    $trimmed = $Text.Trim()
+    if ($trimmed -match '(?s)```[a-zA-Z0-9]*\s*\r?\n(.*?)\r?\n?```') {
+        return $Matches[1].Trim()
+    }
+    # No fence at all -- some models emit the same prose preface around bare
+    # JSON with no fence. Fall back to the outermost {...} span.
+    $start = $trimmed.IndexOf('{')
+    $end = $trimmed.LastIndexOf('}')
+    if ($start -ge 0 -and $end -gt $start) {
+        return $trimmed.Substring($start, $end - $start + 1)
+    }
+    return $trimmed
+}
+
+# The top-level "source code" container folder and its per-system subfolder
+# names are normalized to the canonical system name; the rest of the real
+# source subfolder path is kept as-is beneath it.
+$SystemNameMap = @{
+    "gesacad cobol" = "GESACAD"
+    "sigare 4gl"    = "SIGARE"
+    "sigare web"    = "SIGARE-WEB"
+}
+
+# Some repos nest an immediate subfolder that just repeats their own
+# container name (e.g. "source code/Gesacad cobol/gesacad/cobol/..." - the
+# "gesacad" folder is redundant with the "Gesacad cobol" container it lives
+# in). Listed here per system key so the redundant segment is dropped from
+# output paths instead of showing up twice (e.g. "GESACAD/gesacad/cobol").
+$RedundantContainerSubfolder = @{
+    "gesacad cobol" = "gesacad"
+}
+
+# Mirrors the source's own folder structure under outputs/ (e.g.
+# "source code/Gesacad cobol/gesacad/cobol/aep_4_5_3_2.scb" becomes
+# "GESACAD/cobol/aep_4_5_3_2.scb") instead of flattening it into one
+# long name. Only characters illegal in Windows paths are stripped from each
+# segment.
+function Get-SanitizedRelativeDir {
+    param([string]$RelativePath)
+    $segments = @($RelativePath -split '/' | ForEach-Object { $_ -replace '[:*?"<>|]', '' })
+    if ($segments.Count -ge 2 -and $segments[0] -ieq "source code") {
+        $systemKey = $segments[1].ToLowerInvariant()
+        $systemName = if ($SystemNameMap.ContainsKey($systemKey)) { $SystemNameMap[$systemKey] } else { $segments[1] }
+        $rest = @($segments[2..($segments.Count - 1)])
+        if ($rest.Count -ge 2 -and $RedundantContainerSubfolder.ContainsKey($systemKey) -and $rest[0] -ieq $RedundantContainerSubfolder[$systemKey]) {
+            $rest = @($rest[1..($rest.Count - 1)])
+        }
+        $segments = @($systemName) + $rest
+    }
+    return ($segments -join [System.IO.Path]::DirectorySeparatorChar)
+}
+
+# ---------------- Pipeline ----------------
+
+function Get-SchemaContext {
+    param([System.IO.FileInfo]$SourceFile)
+    $siblingSql = Get-ChildItem -LiteralPath $SourceFile.DirectoryName -Filter "*.sql" -File -ErrorAction SilentlyContinue
+    if (-not $siblingSql) { return $null }
+    return ($siblingSql | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -Encoding Default }) -join "`n`n"
+}
+
+function Set-AgentTiming {
+    param($State, [string]$AgentName, [string]$ModelName, [datetime]$StartedAt, [datetime]$EndedAt, $Usage)
+    $elapsed = [math]::Round(($EndedAt - $StartedAt).TotalSeconds, 2)
+    $agent = $State.token_usage.agents.($AgentName)
+    $agent.model_name = $ModelName
+    $agent.started_at = $StartedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $agent.ended_at = $EndedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $agent.elapsed_seconds = $elapsed
+    if ($Usage) {
+        $agent.prompt_tokens = $Usage.prompt_tokens
+        $agent.completion_tokens = $Usage.completion_tokens
+        $agent.total_tokens = $Usage.total_tokens
+        $State.token_usage.run_total_tokens += [int]$Usage.total_tokens
+    }
+    $State.token_usage.run_total_elapsed_seconds = [math]::Round($State.token_usage.run_total_elapsed_seconds + $elapsed, 2)
+}
+
+function Save-Intermediate {
+    param([string]$OutDir, [string]$AgentName, [string]$Content)
+    $interDir = Join-Path $OutDir "intermediates"
+    if (-not (Test-Path -LiteralPath $interDir)) { New-Item -ItemType Directory -Path $interDir -Force | Out-Null }
+    Write-Utf8NoBom -Path (Join-Path $interDir "$AgentName.txt") -Content $Content
+}
+
+function Update-ManifestEntry {
+    param($Manifest, [string]$RelativePath, $State)
+    $entry = $Manifest.files | Where-Object { $_.path -eq $RelativePath } | Select-Object -First 1
+    if (-not $entry) { return }
+    $entry.status = $State.status
+    $entry.last_completed_stage = $State.last_completed_stage
+    $entry.last_updated = $State.updated_at
+    $entry.token_usage.run_total_tokens = $State.token_usage.run_total_tokens
+    $entry.token_usage.run_total_elapsed_seconds = $State.token_usage.run_total_elapsed_seconds
+    foreach ($agentName in $StageAgents + "file_queue_orchestrator_agent") {
+        if ($entry.token_usage.agents.($agentName) -and $State.token_usage.agents.($agentName)) {
+            $src = $State.token_usage.agents.($agentName)
+            $dst = $entry.token_usage.agents.($agentName)
+            $dst.model_name = $src.model_name
+            $dst.started_at = $src.started_at
+            $dst.ended_at = $src.ended_at
+            $dst.elapsed_seconds = $src.elapsed_seconds
+            $dst.total_tokens = $src.total_tokens
+        }
+    }
+}
+
+function Write-Checkpoint {
+    param($Manifest, [string]$RelativePath, [string]$StateFileRelative, [string]$LastStage, [string]$Status)
+    $counts = @{ queued = 0; in_progress = 0; blocked = 0; completed = 0; failed = 0 }
+    foreach ($f in $Manifest.files) {
+        if ($counts.ContainsKey($f.status)) { $counts[$f.status]++ }
+    }
+    $stamp = Get-UtcNowStamp
+    $checkpoint = [ordered]@{
+        checkpoint_id        = "$($stamp -replace ':', '-')-checkpoint"
+        created_at           = $stamp
+        run_id               = $Manifest.run_id
+        last_processed_file  = [ordered]@{
+            path                 = $RelativePath
+            state_file           = $StateFileRelative
+            last_completed_stage = $LastStage
+            status               = $Status
+        }
+        queue_progress       = [ordered]@{
+            total_files = $Manifest.files.Count
+            completed   = $counts.completed
+            in_progress = $counts.in_progress
+            queued      = $counts.queued
+            blocked     = $counts.blocked
+            failed      = $counts.failed
+        }
+        next_action          = "resume_from_last_completed_stage"
+    }
+    $path = Join-Path $CheckpointsDir "$($stamp -replace ':', '-')-checkpoint.json"
+    Write-Utf8NoBom -Path $path -Content (($checkpoint | ConvertTo-Json -Depth 10) + "`n")
+}
+
+function Invoke-Stage {
+    param(
+        [string]$AgentName, [string]$SystemPrompt, [string]$UserContent,
+        [string]$ModelName, $State, [datetime]$DeadlineUtc
+    )
+    $stageIdx = [array]::IndexOf($StageAgents, $AgentName)
+    $stageLabel = if ($stageIdx -ge 0) { "[stage $($stageIdx + 1)/$($StageAgents.Count)] $AgentName" } else { $AgentName }
+    # Each event below is a single complete Write-Host call (no -NoNewline
+    # split across two calls) so that two workers' lines can never end up
+    # glued together mid-line when their output interleaves.
+    Log "    $stageLabel ..." "DarkGray"
+
+    # This call's own timeout is however much of the file's overall stall
+    # budget is left (floored at MinStageTimeoutSeconds so a nearly-exhausted
+    # budget doesn't hand the HTTP call an unusably tiny timeout), capped by
+    # -TimeoutSec as an absolute outer ceiling.
+    $remainingBudget = ($DeadlineUtc - (Get-Date).ToUniversalTime()).TotalSeconds
+    $callTimeoutSec = [Math]::Max($MinStageTimeoutSeconds, [Math]::Min($remainingBudget, $TimeoutSec))
+
+    $startedAt = Get-Date
+    try {
+        $result = Invoke-OllamaChat -SystemPrompt $SystemPrompt -UserContent $UserContent `
+            -BaseUrl $OllamaUrl -ModelName $ModelName -Temp $Temperature `
+            -MaxTokens $MaxTokensPerStage -Timeout $callTimeoutSec `
+            -HeartbeatLabel "    $stageLabel" -HeartbeatSeconds $HeartbeatSeconds
+    }
+    catch {
+        Set-AgentTiming -State $State -AgentName $AgentName -ModelName $ModelName -StartedAt $startedAt -EndedAt (Get-Date) -Usage $null
+        Log "    $stageLabel FAILED after $([Math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1))s" "Red"
+        throw "[$AgentName] $($_.Exception.Message)"
+    }
+    $endedAt = Get-Date
+    Set-AgentTiming -State $State -AgentName $AgentName -ModelName $ModelName -StartedAt $startedAt -EndedAt $endedAt -Usage $result.Usage
+    Log ("    $stageLabel done ({0}s, {1} tokens)" -f [Math]::Round(($endedAt - $startedAt).TotalSeconds, 1), $result.Usage.total_tokens) "DarkGray"
+    return $result.Content
+}
+
+function Invoke-FileAnalysis {
+    param($Manifest, $Entry, [string]$ModelName)
+
+    $relativePath = $Entry.path
+    # Top-level safety net around this whole function: anything not already
+    # handled by the attemptLoop's own catch below (e.g. Read-State failing
+    # because Entry.state_file points at a path that no longer exists -- this
+    # can happen if another worker/process concurrently moved this file's
+    # state.json between when this worker's manifest snapshot was read and
+    # when it got around to processing this entry) used to be unhandled and
+    # crash the ENTIRE worker process, abandoning every other file still left
+    # in its queue -- exactly what happened when three worker processes ended
+    # up contending for the same queue at once. Now it just skips this one
+    # file and the worker moves on to the next.
+    try {
+    $sourcePath = Join-Path $Root ($relativePath -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $sourcePath)) {
+        Log "  -> SKIP (source file no longer exists): $relativePath" "DarkGray"
+        return
+    }
+    $sourceFile = Get-Item -LiteralPath $sourcePath
+
+    # The manifest's recorded state_file can go stale relative to reality
+    # when a prior run's Save-Manifest crashed AFTER the physical move
+    # (Move-CompletedStateFile/Move-BlockedStateFile) but BEFORE persisting
+    # that move to manifest.json -- confirmed after the File.Replace($null)
+    # bug: files ended up genuinely "completed"/"blocked" on disk while
+    # manifest.json still pointed at their old, now-missing flat-folder
+    # path, and every subsequent run hit "Cannot find path ... state.json"
+    # and permanently SKIPped that file. Rather than getting stuck forever,
+    # look the file up by its state-file leaf name under states/done/ and
+    # states/blocked/ and repoint the entry at whichever one actually exists.
+    if (-not (Test-Path -LiteralPath (Get-StatePath $Entry.state_file))) {
+        $leaf = Split-Path -Leaf $Entry.state_file
+        $found = @($StatesDoneDir, $StatesBlockedDir) | ForEach-Object { Join-Path $_ $leaf } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if (-not $found) {
+            Log "  -> SKIP (state file missing -- not found in done/ or blocked/ either): $relativePath" "Red"
+            return
+        }
+        $relDir = if ((Split-Path -Parent $found) -ieq $StatesDoneDir) { "done" } else { "blocked" }
+        $Entry.state_file = ".analysis-state/states/$relDir/$leaf"
+        $recovered = Read-State -StateFileRelative $Entry.state_file
+        if ($recovered.status -in @("completed", "blocked")) {
+            Log "  Manifest was stale (pointed at a since-moved/missing state file) -- resyncing to its actual $($recovered.status) result: $relativePath" "DarkCyan"
+            Update-ManifestEntry -Manifest $Manifest -RelativePath $relativePath -State $recovered
+            return
+        }
+        Log "  Repointed stale manifest entry to its actual (in-progress) state file: $($Entry.state_file)" "DarkCyan"
+    }
+
+    $state = Read-State -StateFileRelative $Entry.state_file
+    $state.status = "in_progress"
+    if (-not $state.started_at) { $state.started_at = Get-UtcNowStamp }
+    $state.blocker_or_error = $null
+
+    $code = Get-Content -LiteralPath $sourcePath -Raw -Encoding Default
+    $schema = Get-SchemaContext -SourceFile $sourceFile
+    $totalChars = $code.Length + $(if ($schema) { $schema.Length } else { 0 })
+    if ($MaxContentChars -gt 0 -and $totalChars -gt $MaxContentChars) {
+        $state.status = "blocked"
+        $state.blocker_or_error = "Source (+schema) is $totalChars chars, exceeds MaxContentChars=$MaxContentChars"
+        $state.next_action = "increase_MaxContentChars_or_split_file"
+        $state.updated_at = Get-UtcNowStamp
+        Save-State -StateFileRelative $Entry.state_file -State $state
+        Update-ManifestEntry -Manifest $Manifest -RelativePath $relativePath -State $state
+        Move-BlockedStateFile -Entry $Entry -StateFileRelative $Entry.state_file | Out-Null
+        Log "  -> SKIP (too large: $totalChars chars): $relativePath" "Magenta"
+        return
+    }
+
+    $outRelDir = Get-SanitizedRelativeDir -RelativePath $relativePath
+    $outRelPosix = $outRelDir -replace '\\', '/'
+    $outDir = Join-Path $OutputsDir $outRelDir
+    if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+    $leafName = $sourceFile.Name
+    # Keep a copy of the original source alongside its generated analysis so
+    # each output folder is self-contained (readable without the source tree).
+    Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $outDir $leafName) -Force
+
+    # Resume: skip stages already recorded as complete for this file.
+    $resumeIndex = 0
+    if ($state.last_completed_stage) {
+        $idx = [array]::IndexOf($StageAgents, $state.last_completed_stage)
+        if ($idx -ge 0) { $resumeIndex = $idx + 1 }
+    }
+
+    $sanitized = $null; $domain = $null; $structure = $null; $logic = $null
+    $security = $null; $performance = $null; $testing = $null; $diagram = $null
+
+    # Rehydrate prior-stage text from intermediates when resuming past stage 0,
+    # so a resumed run doesn't need to recall lost in-memory context.
+    $interDir = Join-Path $outDir "intermediates"
+    function Get-SavedStage([string]$name) {
+        $p = Join-Path $interDir "$name.txt"
+        if (Test-Path -LiteralPath $p) { return Get-Content -LiteralPath $p -Raw -Encoding UTF8 }
+        return $null
+    }
+    if ($resumeIndex -gt 0) {
+        $sanitized = Get-SavedStage $StageAgents[0]
+        if ($resumeIndex -gt 1) { $domain = Get-SavedStage $StageAgents[1] }
+        if ($resumeIndex -gt 2) { $structure = Get-SavedStage $StageAgents[2] }
+        if ($resumeIndex -gt 3) { $logic = Get-SavedStage $StageAgents[3] }
+        if ($resumeIndex -gt 4) { $security = Get-SavedStage $StageAgents[4] }
+        if ($resumeIndex -gt 5) { $performance = Get-SavedStage $StageAgents[5] }
+        if ($resumeIndex -gt 6) { $testing = Get-SavedStage $StageAgents[6] }
+        if ($resumeIndex -gt 7) { $diagram = Get-SavedStage $StageAgents[7] }
+        if (-not $sanitized) {
+            # Intermediate file missing (e.g. deleted by hand); restart from stage 0.
+            $resumeIndex = 0
+        }
+    }
+
+    # resumeIndex can reach $StageAgents.Count when the prior attempt got as far as
+    # recording the final stage as "last completed" but still failed there (e.g. the
+    # architecture_spec_writer produced invalid JSON) -- that retry re-runs only the
+    # final stage, so report it as such instead of an out-of-range "stage 10/9 ()".
+    if ($resumeIndex -ge $StageAgents.Count) {
+        Log "  Retrying final stage ($($StageAgents[$StageAgents.Count - 1]))" "DarkCyan"
+    } else {
+        Log "  Resuming from stage $($resumeIndex + 1)/$($StageAgents.Count) ($($StageAgents[$resumeIndex]))" "DarkCyan"
+    }
+
+    # Stall guard: this file's total budget is StallMultiplier times the
+    # current estimate (see Get-EstimatedFileSeconds). Budget is charged
+    # against time spent during THIS invocation only -- state.token_usage.
+    # run_total_elapsed_seconds is cumulative across every past attempt this
+    # file has ever had (including old, unrelated blocks from days ago), so
+    # using that total directly would make an already-retried file look
+    # "over budget" the instant a fresh attempt starts, even though nothing
+    # is actually stuck this time. elapsedBeforeThisCall snapshots that
+    # historical total so only the delta accrued just now counts. Each
+    # Invoke-Stage call above is handed the resulting deadline and self-
+    # times-out via its own HTTP call's -TimeoutSec once the budget runs
+    # out, rather than this script needing to interrupt a call from outside.
+    $fileBudgetSeconds = $StallMultiplier * (Get-EstimatedFileSeconds)
+    $elapsedBeforeThisCall = [double]$state.token_usage.run_total_elapsed_seconds
+
+    $attempt = 0
+    $ollamaDownAttempts = 0
+    :attemptLoop while ($true) {
+        $marginThisAttempt = if ($attempt -gt 0) { $StallRetryMarginSeconds } else { 0 }
+        $elapsedThisCall = [double]$state.token_usage.run_total_elapsed_seconds - $elapsedBeforeThisCall
+        $budgetRemainingNow = [Math]::Max($fileBudgetSeconds + $marginThisAttempt - $elapsedThisCall, $MinStageTimeoutSeconds)
+        $fileDeadlineUtc = (Get-Date).ToUniversalTime().AddSeconds($budgetRemainingNow)
+
+    try {
+        if ($resumeIndex -le 0) {
+            $userContent = "CODE:`n$code"
+            if ($schema) { $userContent += "`n`nSCHEMA (DDL):`n$schema" }
+            $sanitized = Invoke-Stage -AgentName $StageAgents[0] -SystemPrompt $SanitizerSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[0] -Content $sanitized
+            $state.last_completed_stage = $StageAgents[0]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+        }
+
+        if ($resumeIndex -le 1) {
+            $domain = Invoke-Stage -AgentName $StageAgents[1] -SystemPrompt $BusinessDomainSystemPrompt -UserContent "SANITISED CODE CONTEXT:`n$sanitized" -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[1] -Content $domain
+            $state.last_completed_stage = $StageAgents[1]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+        }
+
+        if ($resumeIndex -le 2) {
+            $userContent = "SANITISED CODE CONTEXT:`n$sanitized`n`nBUSINESS DOMAIN SUMMARY:`n$domain"
+            $structure = Invoke-Stage -AgentName $StageAgents[2] -SystemPrompt $StructuralMapperSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[2] -Content $structure
+            $state.last_completed_stage = $StageAgents[2]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+        }
+
+        if ($resumeIndex -le 3) {
+            $userContent = "SANITISED CODE CONTEXT:`n$sanitized`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS DOMAIN SUMMARY:`n$domain"
+            $logic = Invoke-Stage -AgentName $StageAgents[3] -SystemPrompt $BusinessLogicSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[3] -Content $logic
+            $state.last_completed_stage = $StageAgents[3]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+        }
+
+        if ($resumeIndex -le 4) {
+            $userContent = "SANITISED CODE CONTEXT:`n$sanitized`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic"
+            $security = Invoke-Stage -AgentName $StageAgents[4] -SystemPrompt $SecuritySystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[4] -Content $security
+            $state.last_completed_stage = $StageAgents[4]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+        }
+
+        if ($resumeIndex -le 5) {
+            $userContent = "STRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic"
+            $performance = Invoke-Stage -AgentName $StageAgents[5] -SystemPrompt $PerformanceSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[5] -Content $performance
+            $state.last_completed_stage = $StageAgents[5]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+        }
+
+        if ($resumeIndex -le 6) {
+            $userContent = "STRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic"
+            $testing = Invoke-Stage -AgentName $StageAgents[6] -SystemPrompt $TestValidationSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[6] -Content $testing
+            $state.last_completed_stage = $StageAgents[6]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+        }
+
+        if ($resumeIndex -le 7) {
+            $userContent = "BUSINESS DOMAIN:`n$domain`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic`n`nSECURITY FINDINGS:`n$security`n`nPERFORMANCE FINDINGS:`n$performance`n`nTEST VALIDATION FINDINGS:`n$testing"
+            $diagram = Invoke-Stage -AgentName $StageAgents[7] -SystemPrompt $DiagramSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[7] -Content $diagram
+            $state.last_completed_stage = $StageAgents[7]; $state.updated_at = Get-UtcNowStamp
+            Save-State -StateFileRelative $Entry.state_file -State $state
+            Write-Utf8NoBom -Path (Join-Path $outDir "diagram.mmd") -Content (Remove-CodeFence $diagram)
+        }
+
+        # Stage 9: final synthesis
+        $finalContext = "FILE PATH: $relativePath`n`nBUSINESS DOMAIN:`n$domain`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic`n`nSECURITY FINDINGS:`n$security`n`nPERFORMANCE FINDINGS:`n$performance`n`nTEST VALIDATION FINDINGS:`n$testing"
+        if ($finalContext.Length -gt $MaxFinalContextChars) {
+            throw "[architecture_spec_writer] Chained context too large: $($finalContext.Length) chars > MaxFinalContextChars=$MaxFinalContextChars"
+        }
+        $rawReport = Invoke-Stage -AgentName $StageAgents[8] -SystemPrompt $ArchitectureSpecSystemPrompt -UserContent $finalContext -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+        Save-Intermediate -OutDir $outDir -AgentName $StageAgents[8] -Content $rawReport
+
+        $outputRefs = @()
+        try {
+            $parsed = (Remove-CodeFence $rawReport) | ConvertFrom-Json
+            $parsed.module_metadata.file_path = $relativePath
+            $reportFileName = "$leafName.json"
+            $reportPath = Join-Path $outDir $reportFileName
+            Write-Utf8NoBom -Path $reportPath -Content (($parsed | ConvertTo-Json -Depth 10) + "`n")
+            $outputRefs += ".analysis-state/outputs/$outRelPosix/$reportFileName"
+            if ($parsed.markdown_report) {
+                $mdFileName = "$leafName.md"
+                $mdPath = Join-Path $outDir $mdFileName
+                Write-Utf8NoBom -Path $mdPath -Content $parsed.markdown_report
+                $outputRefs += ".analysis-state/outputs/$outRelPosix/$mdFileName"
+            }
+            $state.status = "completed"
+            $state.next_action = "none"
+        }
+        catch {
+            $rawFileName = "$leafName.raw.txt"
+            $rawPath = Join-Path $outDir $rawFileName
+            Write-Utf8NoBom -Path $rawPath -Content $rawReport
+            $outputRefs += ".analysis-state/outputs/$outRelPosix/$rawFileName"
+            $state.status = "blocked"
+            $state.blocker_or_error = "architecture_spec_writer output was not valid JSON: $($_.Exception.Message)"
+            $state.next_action = "retry_from_architecture_spec_writer"
+        }
+
+        if (Test-Path -LiteralPath (Join-Path $outDir "diagram.mmd")) {
+            $outputRefs += ".analysis-state/outputs/$outRelPosix/diagram.mmd"
+        }
+        $state.last_completed_stage = $StageAgents[8]
+        $state.output_references = $outputRefs
+        $state.updated_at = Get-UtcNowStamp
+        Save-State -StateFileRelative $Entry.state_file -State $state
+        Update-ManifestEntry -Manifest $Manifest -RelativePath $relativePath -State $state
+        $finalStateFile = $Entry.state_file
+        if ($state.status -eq "completed") {
+            $finalStateFile = Move-CompletedStateFile -Entry $Entry -StateFileRelative $Entry.state_file
+        } elseif ($state.status -eq "blocked") {
+            $finalStateFile = Move-BlockedStateFile -Entry $Entry -StateFileRelative $Entry.state_file
+        }
+        Write-Checkpoint -Manifest $Manifest -RelativePath $relativePath -StateFileRelative $finalStateFile -LastStage $state.last_completed_stage -Status $state.status
+        Log "  -> $($state.status): $relativePath" $(if ($state.status -eq "completed") { "Green" } else { "Yellow" })
+        if ($state.token_usage.run_total_elapsed_seconds -gt 0) {
+            $script:WorkerFileSecondsHistory.Add([double]$state.token_usage.run_total_elapsed_seconds)
+        }
+        break attemptLoop
+    }
+    catch {
+        $isStall = (Get-Date).ToUniversalTime() -ge $fileDeadlineUtc
+        $isOllamaDown = Test-IsTransientOllamaError -Message $_.Exception.Message
+        if ($isStall -and $attempt -eq 0) {
+            Log "  Stalled: $relativePath exceeded its $([Math]::Round($budgetRemainingNow, 0))s budget -- stopping '$ModelName' and retrying with +${StallRetryMarginSeconds}s margin" "Red"
+            Restart-OllamaInstance -BaseUrl $OllamaUrl -ModelKey $ModelName | Out-Null
+            $attempt++
+            continue attemptLoop
+        }
+        if ($isOllamaDown -and $ollamaDownAttempts -lt $OllamaDownMaxRetries) {
+            $ollamaDownAttempts++
+            Log "  Ollama isn't answering ($($_.Exception.Message)) -- waiting ${OllamaDownWaitSeconds}s then restarting '$ModelName' and retrying $relativePath (attempt $ollamaDownAttempts/$OllamaDownMaxRetries)" "Red"
+            Start-Sleep -Seconds $OllamaDownWaitSeconds
+            Restart-OllamaInstance -BaseUrl $OllamaUrl -ModelKey $ModelName | Out-Null
+            $attempt++
+            continue attemptLoop
+        }
+        $state.status = "blocked"
+        $state.blocker_or_error = if ($isOllamaDown) {
+            "Ollama still not answering after $OllamaDownMaxRetries restart attempts: $($_.Exception.Message)"
+        } elseif ($isStall) {
+            "Stalled twice (exceeded budget even after model reload): $($_.Exception.Message)"
+        } else {
+            $_.Exception.Message
+        }
+        $state.next_action = "retry_from_$($state.last_completed_stage)"
+        $state.updated_at = Get-UtcNowStamp
+        Save-State -StateFileRelative $Entry.state_file -State $state
+        Update-ManifestEntry -Manifest $Manifest -RelativePath $relativePath -State $state
+        $blockedStateFile = Move-BlockedStateFile -Entry $Entry -StateFileRelative $Entry.state_file
+        Write-Checkpoint -Manifest $Manifest -RelativePath $relativePath -StateFileRelative $blockedStateFile -LastStage $state.last_completed_stage -Status $state.status
+        Log "  -> BLOCKED: $relativePath :: $($state.blocker_or_error)" "Red"
+        break attemptLoop
+    }
+    }
+    }
+    catch {
+        Log "  -> SKIP (unexpected error, file left as-is for a future run): $relativePath :: $($_.Exception.Message)" "Red"
+    }
+}
+
+function Main {
+    foreach ($path in @($CheckpointsDir, $OutputsDir)) {
+        if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+    }
+
+    $manifest = Read-Manifest
+    # @(...) forces an array even when exactly one item matches -- a bare
+    # PSCustomObject has no synthetic .Count (unlike int/string scalars),
+    # so an un-wrapped single-match result silently prints a blank Count.
+    $eligible = @($manifest.files | Where-Object { $_.status -in @("queued", "blocked", "in_progress") })
+
+    if ($WorkerCount -gt 1) {
+        if ($WorkerIndex -lt 0 -or $WorkerIndex -ge $WorkerCount) {
+            throw "WorkerIndex must be between 0 and WorkerCount-1 (got WorkerIndex=$WorkerIndex, WorkerCount=$WorkerCount)"
+        }
+        # Partition by a hash of each file's OWN path, not by its position in
+        # this array. manifest.json is shared and live: another worker can
+        # complete/block a file (changing its status, dropping it out of
+        # "eligible") between when that worker read the manifest and when
+        # this one does. Index-based partitioning (idx % WorkerCount) shifts
+        # every subsequent file's index whenever that happens, so two workers
+        # started with different manifest snapshots can end up computing
+        # different owners for the same file and both claim it -- confirmed
+        # in practice: worker A blocks a file and moves its state record to
+        # states/blocked/, while worker B's own (already-partitioned, now
+        # stale) copy still points at the old flat path and throws "Cannot
+        # find path ... does not exist" when it gets there. A hash of the
+        # path itself is invariant regardless of what any other file's status
+        # does in the meantime, so ownership never drifts between workers.
+        $eligible = @($eligible | Where-Object { (Get-PathWorkerHash -RelativePath $_.path) % $WorkerCount -eq $WorkerIndex })
+        Log "Worker $($WorkerIndex + 1) owns $($eligible.Count) of the eligible files." "Cyan"
+    }
+
+    if ($eligible.Count -eq 0) {
+        Log "Nothing to process: no queued/blocked/in_progress files in the manifest." "Green"
+        return
+    }
+
+    $toProcess = $eligible
+    if ($Limit -gt 0) { $toProcess = @($eligible | Select-Object -First $Limit) }
+
+    if ($DryRun) {
+        Log "Would process $($toProcess.Count) file(s) (of $($eligible.Count) eligible):" "Cyan"
+        foreach ($entry in $toProcess) {
+            $resumeNote = if ($entry.last_completed_stage) { "resume after $($entry.last_completed_stage)" } else { "start from stage 1" }
+            Log "  [$($entry.status)] $($entry.path) -- $resumeNote"
+        }
+        return
+    }
+
+    if (-not $NoAutoStart) {
+        Start-OllamaInstanceIfNeeded -BaseUrl $OllamaUrl -CudaDevice $CudaVisibleDevices -ModelsPath $OllamaModelsPath -ModelKey $Model
+    }
+
+    $modelName = $Model
+    Log "Using model: $modelName" "Cyan"
+    Log "Processing $($toProcess.Count) file(s) of $($eligible.Count) eligible ..." "Cyan"
+
+    $i = 0
+    foreach ($entry in $toProcess) {
+        $i++
+        Log "[$i/$($toProcess.Count)] $($entry.path)" "Yellow"
+        Invoke-FileAnalysis -Manifest $manifest -Entry $entry -ModelName $modelName
+        Save-Manifest -Manifest $manifest -UpdatedPath $entry.path
+    }
+
+    # Re-read from disk for the summary: with concurrent workers, this
+    # process's in-memory manifest only reflects its own partition.
+    $finalManifest = Read-Manifest
+    $completed = @($finalManifest.files | Where-Object { $_.status -eq "completed" }).Count
+    $blocked = @($finalManifest.files | Where-Object { $_.status -eq "blocked" }).Count
+    Log ""
+    Log "--- Run summary ---"
+    Log "Processed this run : $($toProcess.Count)"
+    Log "Completed (total)  : $completed"
+    Log "Blocked (total)    : $blocked"
+    Log ""
+    & (Join-Path $PSScriptRoot "queue_eta.ps1") -Workers $WorkerCount
+}
+
+try {
+    Main
+}
+finally {
+    Remove-Item -LiteralPath $LockFilePath -Force -ErrorAction SilentlyContinue
+}

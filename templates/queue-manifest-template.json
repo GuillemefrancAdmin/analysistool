@@ -1,0 +1,93 @@
+{
+    "run_id": "2026-09-17T00:00:00Z",
+    "status": "pending",
+    "scan_each_turn": true,
+    "processing_mode": "one-file-at-a-time",
+    "files": [
+        {
+            "path": "source code/Gesacad cobol/gesacad/cobol/example.scb",
+            "file_name": "example.scb",
+            "analysis_type": "legacy-source-analysis",
+            "status": "queued",
+            "last_completed_stage": null,
+            "last_updated": null,
+            "state_file": ".analysis-state/states/example.scb.state.json",
+            "token_usage": {
+                "run_total_tokens": 0,
+                "run_total_elapsed_seconds": 0,
+                "agents": {
+                    "file_queue_orchestrator_agent": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "sanitizer_context_ingestion_agent": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "business_domain_extractor": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "source_ast_structural_mapper": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "business_logic_extractor": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "security_compliance_analyst": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "performance_scalability_analyst": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "test_validation_analyst": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "diagram_designer_context_visualizer": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    },
+                    "architecture_spec_writer": {
+                        "model_name": "",
+                        "started_at": null,
+                        "ended_at": null,
+                        "elapsed_seconds": 0,
+                        "total_tokens": 0
+                    }
+                }
+            }
+        }
+    ]
+}

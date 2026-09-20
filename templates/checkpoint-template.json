@@ -1,0 +1,20 @@
+{
+    "checkpoint_id": "2026-09-17T00-00-00Z-checkpoint",
+    "created_at": "2026-09-17T00:00:00Z",
+    "run_id": "2026-09-17T00:00:00Z",
+    "last_processed_file": {
+        "path": "source code/Gesacad cobol/gesacad/cobol/example.scb",
+        "state_file": ".analysis-state/states/example.scb.state.json",
+        "last_completed_stage": "sanitizer_context_ingestion_agent",
+        "status": "in_progress"
+    },
+    "queue_progress": {
+        "total_files": 480,
+        "completed": 0,
+        "in_progress": 1,
+        "queued": 479,
+        "blocked": 0,
+        "failed": 0
+    },
+    "next_action": "resume_from_last_completed_stage"
+}

@@ -1,0 +1,15 @@
+.analysis-state/
+Processus affaires/
+source code/
+
+# Local Claude Code state (personal, machine-specific)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs
+*.log
