@@ -43,7 +43,7 @@ $inProgress = @($manifest.files | Where-Object { $_.status -eq "in_progress" })
 $queued = @($manifest.files | Where-Object { $_.status -eq "queued" })
 $remaining = @($manifest.files | Where-Object { $_.status -in @("queued", "blocked", "in_progress") })
 
-Write-Host "--- Analysis queue progress ---" -ForegroundColor Cyan
+Write-Host ("--- Analysis queue progress ({0}) ---" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss")) -ForegroundColor Cyan
 Write-Host ("Completed    : {0}" -f $completed.Count)
 Write-Host ("Remaining    : {0}  (queued {1}, blocked {2}, in_progress {3})" -f $remaining.Count, $queued.Count, $blocked.Count, $inProgress.Count)
 

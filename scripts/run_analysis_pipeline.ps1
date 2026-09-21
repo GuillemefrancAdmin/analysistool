@@ -39,7 +39,12 @@ param(
     [string]$OllamaUrl = "http://localhost:11434/v1",
     [string]$Model = "llama3.1:8b",
     [double]$Temperature = 0.2,
-    [int]$MaxTokensPerStage = 0,
+    # 0 would leave max_tokens unset, letting a stage that never emits a stop
+    # token run all the way to the model's context limit -- observed in
+    # practice as a single stage stuck "still working" for over an hour on an
+    # 8-line input. Real stage outputs run a few hundred to ~2k tokens, so
+    # 4096 leaves headroom without allowing that runaway.
+    [int]$MaxTokensPerStage = 4096,
     [int]$TimeoutSec = 86400,
     [int]$MaxContentChars = 0,
     [int]$MaxFinalContextChars = 160000,
@@ -167,7 +172,8 @@ $script:WorkerFileSecondsHistory = New-Object System.Collections.Generic.List[do
 function Log {
     param([string]$Text, [string]$Color = "White")
     $effectiveColor = if ($Color -eq "Red") { "Red" } else { $WorkerLogColor }
-    Write-Host "$WorkerTag$Text" -ForegroundColor $effectiveColor
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "[$timestamp] $WorkerTag$Text" -ForegroundColor $effectiveColor
 }
 
 # ---------------- System prompts, one per skill in skills/ ----------------
@@ -544,7 +550,25 @@ function Write-Utf8NoBom {
         # (throwaway) backup path avoids the bug; it's deleted right after
         # since the replace already landed by the time we get here.
         $backupPath = "$Path.bak-$PID"
-        [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+        # Retry on sharing violations: something (AV real-time scan, search
+        # indexer) briefly opens a just-written file often enough, under this
+        # script's write volume, to intermittently fail Replace with "The
+        # process cannot access the file because it is being used by another
+        # process." -- observed in practice cascading into repeated save
+        # failures for a worker. The lock clears on its own within
+        # milliseconds, so a short retry absorbs it instead of failing the
+        # whole stage/file over a transient scan.
+        $maxAttempts = 5
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+                break
+            }
+            catch [System.IO.IOException] {
+                if ($attempt -eq $maxAttempts) { throw }
+                Start-Sleep -Milliseconds (100 * $attempt)
+            }
+        }
         Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
     }
     else {
@@ -556,7 +580,26 @@ function Read-Manifest {
     if (-not (Test-Path -LiteralPath $ManifestPath)) {
         throw "No manifest found at $ManifestPath. Run generate_analysis_queue.ps1 first."
     }
-    return Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    # Retry on a locked-file IOException (AV/indexer, same as Write-Utf8NoBom)
+    # or a JSON parse failure: manifest.json is tens of MB and rewritten by
+    # two workers throughout the run, so a read landing in the split-second
+    # around another process's atomic File.Replace can occasionally catch a
+    # torn/incomplete file even though the replace itself is atomic. Either
+    # failure clears within milliseconds once the other write finishes.
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            return Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -eq $maxAttempts) { throw }
+            Start-Sleep -Milliseconds (100 * $attempt)
+        }
+        catch {
+            if ($attempt -eq $maxAttempts) { throw }
+            Start-Sleep -Milliseconds (100 * $attempt)
+        }
+    }
 }
 
 # Estimated seconds for one file, used as the stall guard's baseline

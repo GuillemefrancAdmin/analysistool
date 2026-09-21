@@ -73,7 +73,19 @@ function Write-Utf8NoBom {
         # Write-Utf8NoBom -- File.Replace's 3-arg overload throws on a
         # $null backup-file argument here; a real throwaway path works.
         $backupPath = "$Path.bak-$PID"
-        [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+        # Retry on transient sharing violations (AV/indexer) -- see the
+        # matching comment in run_analysis_pipeline.ps1's Write-Utf8NoBom.
+        $maxAttempts = 5
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+                break
+            }
+            catch [System.IO.IOException] {
+                if ($attempt -eq $maxAttempts) { throw }
+                Start-Sleep -Milliseconds (100 * $attempt)
+            }
+        }
         Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
     }
     else {

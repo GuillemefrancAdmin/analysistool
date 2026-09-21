@@ -42,7 +42,9 @@ param(
     [string[]]$CudaDevices = @("1", "0"),
     [string]$OllamaModelsPath = "E:\ollama\models",
     [double]$Temperature = 0.2,
-    [int]$MaxTokensPerStage = 0,
+    # See run_analysis_pipeline.ps1's default: prevents a stage that never
+    # emits a stop token from running away to the context limit.
+    [int]$MaxTokensPerStage = 4096,
     [int]$TimeoutSec = 86400,
     [int]$MaxContentChars = 0,
     [int]$MaxFinalContextChars = 160000,
@@ -179,6 +181,7 @@ for ($i = 0; $i -lt $workerCount; $i++) {
         Model     = $Model
         Job       = $job
         LastState = $job.State
+        Drained   = $false
     }
 }
 
@@ -190,6 +193,18 @@ Write-Host ""
 function Drain-JobOutput {
     param($Entries)
     foreach ($entry in $Entries) {
+        # Once a job reaches a terminal state (e.g. its host process crashed --
+        # observed in practice as a raw AccessViolationException taking down
+        # the whole worker process), Receive-Job keeps re-surfacing the SAME
+        # terminating error via -ErrorVariable on every single call, unlike
+        # normal output which drains once and is gone. Left unguarded, that
+        # turns into the same "[Worker N] ERROR: ..." line repeating forever,
+        # every poll cycle, for the rest of the run -- drowning out every
+        # other worker's real output. Drain a dead job exactly once more after
+        # it stops running (to catch any trailing output/the state-change
+        # notice below), then leave it alone.
+        if ($entry.Job.State -ne "Running" -and $entry.Drained) { continue }
+
         # No -Keep: each call drains only what's arrived since the last one, so
         # nothing needs to be manually deduped. (-Keep was tried first but a
         # PowerShell job-buffer quirk made it replay already-seen records on
@@ -209,15 +224,21 @@ function Drain-JobOutput {
         $jobErrors = $null
         $new = @(Receive-Job -Job $entry.Job -ErrorVariable jobErrors -ErrorAction SilentlyContinue)
         foreach ($line in $new) { Write-Host $line }
-        foreach ($err in $jobErrors) { Write-Host "[Worker $($entry.Index + 1)] ERROR: $err" -ForegroundColor Red }
+        foreach ($err in $jobErrors) {
+            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            Write-Host "[$timestamp] [Worker $($entry.Index + 1)] ERROR: $err" -ForegroundColor Red
+        }
 
         if ($entry.Job.State -ne $entry.LastState) {
             if ($entry.Job.State -in @("Failed", "Stopped")) {
                 $reason = $entry.Job.ChildJobs[0].JobStateInfo.Reason
-                Write-Host "[Worker $($entry.Index + 1)] job $($entry.Job.State)$(if ($reason) { ": $reason" })" -ForegroundColor Red
+                $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                Write-Host "[$timestamp] [Worker $($entry.Index + 1)] job $($entry.Job.State)$(if ($reason) { ": $reason" })" -ForegroundColor Red
             }
             $entry.LastState = $entry.Job.State
         }
+
+        if ($entry.Job.State -ne "Running") { $entry.Drained = $true }
     }
 }
 
