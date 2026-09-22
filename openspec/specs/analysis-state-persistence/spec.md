@@ -15,7 +15,7 @@ Each discovered source file SHALL have exactly one corresponding state file name
 
 #### Scenario: State file fields present after any update
 - **WHEN** a file's state is saved after any pipeline stage
-- **THEN** the state file contains all of `source_path`, `status`, `last_completed_stage`, `updated_at`, `blocker_or_error`, `next_action`, `output_references`, and `token_usage.agents.<agent_name>` entries for every one of the ten agent names
+- **THEN** the state file contains all of `source_path`, `status`, `last_completed_stage`, `updated_at`, `blocker_or_error`, `next_action`, `output_references`, and `token_usage.agents.<agent_name>` entries for every one of the eleven agent names
 
 ### Requirement: Status-based state file relocation
 A file's state record SHALL be relocated from `states/` into a status-specific subfolder — `states/done/` on completion, `states/blocked/` on blocking — so the top-level `states/` folder reflects only files still in flight; the manifest's `state_file` reference SHALL be updated to match.
@@ -36,11 +36,11 @@ A checkpoint file named `<timestamp>-checkpoint.json` SHALL be written after eac
 - **THEN** a new checkpoint file is written recording that file as `last_processed_file` with status `completed` and updated `queue_progress` counts
 
 ### Requirement: Output artifacts kept self-contained per file
-Generated outputs for a file (sanitized/intermediate stage text, the final JSON report, an optional markdown report, and a diagram file) SHALL be written under `.analysis-state/outputs/<sanitized-relative-dir>/`, alongside a copy of the original source file, so each output folder is readable without the source tree present.
+Generated outputs for a file (sanitized/intermediate stage text, the final JSON report, a markdown narrative, and a diagram file) SHALL be written under `.analysis-state/outputs/<sanitized-relative-dir>/`, alongside a copy of the original source file, so each output folder is readable without the source tree present. The markdown narrative is the `narrative_writer` stage's own independent output artifact, not a field embedded in the JSON report.
 
 #### Scenario: Output folder contents after completion
 - **WHEN** a file completes analysis
-- **THEN** its output folder contains a copy of the original source file, an `intermediates/` folder with each stage's saved text, the final `<file>.json` report, and (if applicable) `<file>.md` and `diagram.mmd`
+- **THEN** its output folder contains a copy of the original source file, an `intermediates/` folder with each stage's saved text, the final `<file>.json` report, and (if that stage itself completed) `<file>.md` and `diagram.mmd`
 
 ### Requirement: Manifest is the live, mutable index
 `.analysis-state/queue/manifest.json` SHALL be the single mutable index of all tracked files and their status, safe for concurrent read by reporting tools (`queue_eta.ps1`) and concurrent read-modify-write by multiple pipeline workers, via the write safety and locking behavior defined in `source-discovery-queue` and `sequential-pipeline-execution`.

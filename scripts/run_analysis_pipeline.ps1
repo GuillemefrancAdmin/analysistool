@@ -27,9 +27,12 @@
 #   GPU: Ollama pins a whole server *process* to a GPU via CUDA_VISIBLE_
 #   DEVICES at launch (unlike LM Studio, which can't guarantee physical GPU
 #   placement per model identifier), so each worker needs its own port and
-#   CUDA device. Give each instance the same -WorkerCount and a distinct
-#   0-based -WorkerIndex so they partition the eligible files instead of
-#   racing to pick up the same ones. Two terminals:
+#   CUDA device. There's no fixed per-worker slice of the queue -- every
+#   worker atomically claims its next file from the shared manifest as it
+#   goes (see Request-NextFile), so a worker that finishes faster than its
+#   peers immediately helps with whatever they haven't gotten to yet instead
+#   of exiting. -WorkerIndex/-WorkerCount only affect this worker's own log
+#   tag/color and its lock-file metadata. Two terminals:
 #     .\run_analysis_pipeline.ps1 -Limit 0 -OllamaUrl http://127.0.0.1:11435/v1 -CudaVisibleDevices 1 -WorkerIndex 0 -WorkerCount 2
 #     .\run_analysis_pipeline.ps1 -Limit 0 -OllamaUrl http://127.0.0.1:11436/v1 -CudaVisibleDevices 0 -WorkerIndex 1 -WorkerCount 2
 #   (run_analysis_pipeline_parallel.ps1 does this automatically.)
@@ -49,12 +52,17 @@ param(
     [int]$MaxContentChars = 0,
     [int]$MaxFinalContextChars = 160000,
     [switch]$DryRun,
-    # Run several instances of this script at once against the same queue,
-    # one per available model/GPU: give each instance the same -WorkerCount
-    # and a distinct -WorkerIndex (0-based) so they partition the eligible
-    # files instead of racing to pick up the same ones.
+    # Purely cosmetic/identifying now (log tag+color, lock-file metadata):
+    # workers no longer partition the queue by these -- see Request-NextFile.
     [int]$WorkerIndex = 0,
     [int]$WorkerCount = 1,
+    # An in_progress file is claimable by ANY worker once idle this long,
+    # which is what lets a file abandoned by a worker that crashed outright
+    # (e.g. the clr.dll access violation case, where nothing in-script gets
+    # a chance to mark it blocked) get picked back up by whichever worker is
+    # next free, resuming from its last completed stage -- rather than
+    # sitting stuck until that exact same (now-dead) worker comes back.
+    [int]$StaleInProgressSeconds = 300,
     # Stall guard: a file's total budget is StallMultiplier times this
     # worker's own average seconds/file (falling back to the queue-wide
     # average, then BootstrapFileSeconds, until this worker has completed
@@ -132,19 +140,13 @@ $LockFilePath = Join-Path $LocksDir "$PID.lock"
 # session.
 $script:ManifestMutex = New-Object System.Threading.Mutex($false, "AnalysisPipelineManifestLock")
 
-# Order matters: this is the actual execution chain. Index 0
-# (file_queue_orchestrator_agent) is this script itself, not an LLM stage.
-$StageAgents = @(
-    "sanitizer_context_ingestion_agent",
-    "business_domain_extractor",
-    "source_ast_structural_mapper",
-    "business_logic_extractor",
-    "security_compliance_analyst",
-    "performance_scalability_analyst",
-    "test_validation_analyst",
-    "diagram_designer_context_visualizer",
-    "architecture_spec_writer"
-)
+# The stage roster (order, prompts-by-reference, input composition) lives in
+# one shared file so this script and generate_analysis_queue.ps1 can't drift
+# out of sync with each other - see pipeline_stages.ps1 for the full chain.
+# file_queue_orchestrator_agent (this script itself, not an LLM stage) is the
+# only entry Get-AllAgentNames returns that $StageAgents excludes.
+. (Join-Path $PSScriptRoot "pipeline_stages.ps1")
+$StageAgents = Get-AllAgentNames | Select-Object -Skip 1
 
 # Tag every printed line with which worker wrote it. This is done at the
 # source (not left to the parallel orchestrator's job-output prefixing)
@@ -187,6 +189,11 @@ You are the Sanitizer & Context Ingestion Agent for a legacy modernization pipel
 Output ONLY the resulting "Sanitised Code Context" as plain text: cleaned code annotated with schema notes. No preamble, no markdown fences, no summary.
 '@
 
+# These stay as top-level variables (one per stage, for readability) rather
+# than moving into pipeline_stages.ps1's data table; each middle stage's
+# entry there references its prompt by variable name (SystemPromptVar) and
+# looks it up via Get-Variable at call time, so static analysis can't see the
+# use and will flag these as "assigned but never used" - a false positive.
 $BusinessDomainSystemPrompt = @'
 You are the Business Domain Extractor Agent. You receive a Sanitised Code Context. Your job:
 1. Identify the business area and core entities this module operates on.
@@ -254,6 +261,15 @@ Keep it readable: summarize, do not enumerate every line of code.
 Output ONLY a single fenced Mermaid code block (```mermaid ... ```) and nothing else.
 '@
 
+$NarrativeWriterSystemPrompt = @'
+You are the Narrative Writer Agent for a legacy modernization pipeline. You receive the Business Domain, Structural, Business Logic, Security, Performance, and Test Validation findings for one module. Your job is to explain this module's PURPOSE - why it exists and what business role it fills - as prose a developer or business stakeholder can read on its own, without needing the rest of the report.
+1. Lead with what business need this module serves and why it exists.
+2. Explain what it actually does to serve that need, grounded in its real entry points and business rules (from the Structural and Business Logic findings) - not generic or invented business narrative.
+3. Briefly note how it relates to what it depends on or is depended on by, if relevant.
+4. Do NOT restate the Security, Performance, or Test Validation findings, and do not re-catalog the Structural breakdown - those already have their own report sections. Use them only as grounding for the purpose explanation.
+Output ONLY the Markdown narrative as plain prose and headings. No JSON, no fenced code block, no preamble or commentary outside the document itself.
+'@
+
 # The one stage whose output is parsed as JSON. Array-of-object fields from
 # the full report schema are deliberately flattened to strings here (see
 # header comment) to avoid grammar-constrained decoding entirely -- this
@@ -280,11 +296,10 @@ You are the Architecture & Spec Writer Agent, the final synthesis step of a lega
     "reliability": {"score": 0.0, "findings": ""}, "security": {"score": 0.0, "findings": ""},
     "maintainability": {"score": 0.0, "findings": ""}, "portability": {"score": 0.0, "findings": ""}
   },
-  "modernization_recommendations": {"recommended_7r_strategy": "Rehost|Replatform|Refactor|Rearchitect|Rebuild|Retire|Retain", "target_architecture_pattern": "microservice|event_driven_module|serverless_function|modular_monolith_component|batch_job", "refactoring_complexity_level": "trivial|moderate|complex|extreme_risk", "estimated_person_hours": 0, "strangler_fig_suitability": false, "target_technology_stack": [""], "step_by_step_migration_plan": [""]},
-  "markdown_report": ""
+  "modernization_recommendations": {"recommended_7r_strategy": "Rehost|Replatform|Refactor|Rearchitect|Rebuild|Retire|Retain", "target_architecture_pattern": "microservice|event_driven_module|serverless_function|modular_monolith_component|batch_job", "refactoring_complexity_level": "trivial|moderate|complex|extreme_risk", "estimated_person_hours": 0, "strangler_fig_suitability": false, "target_technology_stack": [""], "step_by_step_migration_plan": [""]}
 }
 
-"markdown_report" must be a complete Markdown document (escaped as a JSON string) covering all sections above, suitable to hand to a developer. Return ONLY the JSON object, no prose outside it, no markdown fences.
+Return ONLY the JSON object, no prose outside it, no markdown fences.
 '@
 
 # ---------------- Ollama plumbing ----------------
@@ -509,26 +524,6 @@ function Get-UtcNowStamp {
     return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 }
 
-# Deterministic, non-negative hash of a file's own relative path, used to
-# assign it to exactly one worker (see the WorkerCount partitioning in Main).
-# Must depend only on the path string itself -- never on array position or
-# any other file's state -- so every worker computes the same owner for a
-# given file regardless of when it snapshotted the (concurrently mutating)
-# manifest. [string]::GetHashCode() is unsuitable here: .NET randomizes it
-# per-process by default, so it would disagree across worker processes.
-function Get-PathWorkerHash {
-    param([string]$RelativePath)
-    $sha1 = [System.Security.Cryptography.SHA1]::Create()
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($RelativePath)
-        $hashBytes = $sha1.ComputeHash($bytes)
-        return [System.BitConverter]::ToUInt32($hashBytes, 0)
-    }
-    finally {
-        $sha1.Dispose()
-    }
-}
-
 function Write-Utf8NoBom {
     param([string]$Path, [string]$Content)
     # Write-then-rename instead of an in-place WriteAllText: this file
@@ -671,6 +666,59 @@ function Save-Manifest {
     }
 }
 
+# Atomically claims the next available file from the shared manifest instead
+# of each worker being handed a fixed slice up front -- so a worker that
+# finishes faster than its peers (smaller files, a faster GPU, or just
+# finishing earlier) immediately pulls more work rather than exiting while
+# others are still busy. "Available" means queued/blocked, or an in_progress
+# entry that's gone stale (its last_updated is older than $StaleSeconds) --
+# that second case is what lets ANY worker resume a file abandoned by a
+# process that crashed outright (e.g. the clr.dll access violation case
+# where nothing in-script gets a chance to mark it blocked) without needing
+# to be that same, now-dead worker.
+# $script:ManifestMutex is a real Win32 mutex with thread-affinity recursion,
+# so nesting Save-Manifest's own WaitOne inside this function's already-held
+# lock (same thread, no separate runspaces here) succeeds immediately rather
+# than deadlocking -- this whole find-mark-persist sequence needs to be one
+# atomic critical section, otherwise two workers could both see the same
+# "queued" entry as claimable in the gap between reading and writing it.
+function Request-NextFile {
+    param([int]$StaleSeconds = 300)
+    $acquired = $false
+    try {
+        try {
+            $acquired = $script:ManifestMutex.WaitOne(60000)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            throw "Timed out waiting for the cross-process manifest lock while claiming a file."
+        }
+
+        $manifest = Read-Manifest
+        $claimed = $manifest.files | Where-Object { $_.status -in @("queued", "blocked") } | Select-Object -First 1
+        if (-not $claimed) {
+            $nowUtc = (Get-Date).ToUniversalTime()
+            $claimed = $manifest.files | Where-Object {
+                if ($_.status -ne "in_progress") { return $false }
+                $lastUpdated = $null
+                if ($_.last_updated) { try { $lastUpdated = [datetime]::Parse($_.last_updated).ToUniversalTime() } catch {} }
+                return (-not $lastUpdated) -or (($nowUtc - $lastUpdated).TotalSeconds -ge $StaleSeconds)
+            } | Select-Object -First 1
+        }
+        if (-not $claimed) { return $null }
+
+        $claimed.status = "in_progress"
+        $claimed.last_updated = Get-UtcNowStamp
+        Save-Manifest -Manifest $manifest -UpdatedPath $claimed.path
+        return [PSCustomObject]@{ Manifest = $manifest; Entry = $claimed }
+    }
+    finally {
+        if ($acquired) { $script:ManifestMutex.ReleaseMutex() }
+    }
+}
+
 function Get-StatePath {
     param([string]$StateFileRelative)
     return Join-Path $Root ($StateFileRelative -replace '/', '\')
@@ -744,6 +792,66 @@ function Remove-CodeFence {
     return $trimmed
 }
 
+function Repair-JsonEscapes {
+    # architecture_spec_writer is asked to quote raw source snippets (e.g. into
+    # "entry_points") for shell scripts that are themselves sed/regex one-liners
+    # full of backslashes ('s/\+\s\1/g', 's#\.#,#g'). The 8B model echoes those
+    # verbatim without doubling the backslash, so ConvertFrom-Json rejects the
+    # result with "Unrecognized escape sequence" and the file gets stuck in
+    # blocked/retry_from_architecture_spec_writer forever, since a retry only
+    # re-runs this same stage against the same input and gets the same output.
+    # Double any backslash that isn't already the start of a valid JSON escape
+    # (\" \\ \/ \b \f \n \r \t \uXXXX) so the text becomes parseable. This is a
+    # no-op on already-valid JSON, so it's safe to apply unconditionally.
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    # Matched as alternation so a valid escape (incl. \uXXXX) is consumed as a
+    # whole pair and left untouched -- a lookahead-only approach re-examines
+    # the second backslash of an already-valid "\\" independently and can
+    # corrupt it (e.g. "\\ " -> "\\\ ") when the char after it isn't itself a
+    # valid escape starter.
+    return [regex]::Replace($Text, '\\u[0-9a-fA-F]{4}|\\["\\/bfnrt]|\\', {
+        param($m)
+        if ($m.Value.Length -gt 1) { $m.Value } else { '\\' }
+    })
+}
+
+function Repair-JsonTruncation {
+    # Separately from bad escaping, the 8B model sometimes drops just the final
+    # closing brace(s) of the object even on a normal (non-length-capped) stop
+    # -- seen on killprocesssigare.sh, where completion_tokens landed nowhere
+    # near MaxTokensPerStage yet the response was one "}" short. Walk the text
+    # tracking open braces/brackets, skipping over string contents (respecting
+    # backslash-escaped characters so a quote inside a string doesn't look like
+    # a close), and append whatever closers are still outstanding at EOF. A
+    # no-op on already-well-formed JSON.
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    $stack = New-Object System.Collections.Generic.Stack[char]
+    $inString = $false
+    $escaped = $false
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($inString) {
+            if ($escaped) { $escaped = $false }
+            elseif ($ch -eq '\') { $escaped = $true }
+            elseif ($ch -eq '"') { $inString = $false }
+            continue
+        }
+        switch ($ch) {
+            '"' { $inString = $true }
+            '{' { $stack.Push('}') }
+            '[' { $stack.Push(']') }
+            '}' { if ($stack.Count -gt 0) { [void]$stack.Pop() } }
+            ']' { if ($stack.Count -gt 0) { [void]$stack.Pop() } }
+        }
+    }
+    if ($stack.Count -eq 0 -and -not $inString) { return $Text }
+    $suffix = ''
+    if ($inString) { $suffix += '"' }
+    while ($stack.Count -gt 0) { $suffix += $stack.Pop() }
+    return $Text + $suffix
+}
+
 # The top-level "source code" container folder and its per-system subfolder
 # names are normalized to the canonical system name; the rest of the real
 # source subfolder path is kept as-is beneath it.
@@ -794,6 +902,14 @@ function Get-SchemaContext {
 function Set-AgentTiming {
     param($State, [string]$AgentName, [string]$ModelName, [datetime]$StartedAt, [datetime]$EndedAt, $Usage)
     $elapsed = [math]::Round(($EndedAt - $StartedAt).TotalSeconds, 2)
+    if (-not $State.token_usage.agents.($AgentName)) {
+        # A state file saved before this agent existed in the chain (e.g. a
+        # file completed prior to narrative_writer being added) won't have
+        # this property yet -- same Windows PowerShell 5.1 "property cannot
+        # be found on assignment" issue Update-ManifestEntry's Add-Member
+        # calls above already work around, just one level deeper.
+        $State.token_usage.agents | Add-Member -NotePropertyName $AgentName -NotePropertyValue ([PSCustomObject](New-EmptyAgentUsage)) -Force
+    }
     $agent = $State.token_usage.agents.($AgentName)
     $agent.model_name = $ModelName
     $agent.started_at = $StartedAt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -822,6 +938,20 @@ function Update-ManifestEntry {
     $entry.status = $State.status
     $entry.last_completed_stage = $State.last_completed_stage
     $entry.last_updated = $State.updated_at
+    # Add-Member -Force (not plain assignment): on Windows PowerShell 5.1,
+    # a ConvertFrom-Json PSCustomObject throws "property ... cannot be
+    # found" on assignment to a property it doesn't already have -- unlike
+    # PowerShell 7's dynamic-add behavior -- and every pre-existing
+    # manifest.json entry predates these two fields (confirmed by testing
+    # plain assignment against a real ConvertFrom-Json object first; it
+    # failed). -Force makes this the same call whether the property is
+    # being added for the first time or just updated on a later run.
+    # Previously these lived only in each file's own states/*.state.json --
+    # manifest.json itself had no way to say where a completed file's
+    # report landed or why a blocked one failed without opening that
+    # separate file.
+    $entry | Add-Member -NotePropertyName "blocker_or_error" -NotePropertyValue $State.blocker_or_error -Force
+    $entry | Add-Member -NotePropertyName "output_references" -NotePropertyValue $State.output_references -Force
     $entry.token_usage.run_total_tokens = $State.token_usage.run_total_tokens
     $entry.token_usage.run_total_elapsed_seconds = $State.token_usage.run_total_elapsed_seconds
     foreach ($agentName in $StageAgents + "file_queue_orchestrator_agent") {
@@ -991,8 +1121,13 @@ function Invoke-FileAnalysis {
         if ($idx -ge 0) { $resumeIndex = $idx + 1 }
     }
 
-    $sanitized = $null; $domain = $null; $structure = $null; $logic = $null
-    $security = $null; $performance = $null; $testing = $null; $diagram = $null
+    # $sanitized stays its own variable (the sanitizer is one of the two
+    # bespoke endpoint stages); every uniform middle stage's result is keyed
+    # by stage name in $results instead of one hand-declared variable each -
+    # a new entry in pipeline_stages.ps1's $PipelineStages needs no matching
+    # declaration here.
+    $sanitized = $null
+    $results = @{}
 
     # Rehydrate prior-stage text from intermediates when resuming past stage 0,
     # so a resumed run doesn't need to recall lost in-memory context.
@@ -1003,14 +1138,12 @@ function Invoke-FileAnalysis {
         return $null
     }
     if ($resumeIndex -gt 0) {
-        $sanitized = Get-SavedStage $StageAgents[0]
-        if ($resumeIndex -gt 1) { $domain = Get-SavedStage $StageAgents[1] }
-        if ($resumeIndex -gt 2) { $structure = Get-SavedStage $StageAgents[2] }
-        if ($resumeIndex -gt 3) { $logic = Get-SavedStage $StageAgents[3] }
-        if ($resumeIndex -gt 4) { $security = Get-SavedStage $StageAgents[4] }
-        if ($resumeIndex -gt 5) { $performance = Get-SavedStage $StageAgents[5] }
-        if ($resumeIndex -gt 6) { $testing = Get-SavedStage $StageAgents[6] }
-        if ($resumeIndex -gt 7) { $diagram = Get-SavedStage $StageAgents[7] }
+        $sanitized = Get-SavedStage $SanitizerStageName
+        for ($i = 0; $i -lt $PipelineStages.Count; $i++) {
+            if ($resumeIndex -gt ($i + 1)) {
+                $results[$PipelineStages[$i].Name] = Get-SavedStage $PipelineStages[$i].Name
+            }
+        }
         if (-not $sanitized) {
             # Intermediate file missing (e.g. deleted by hand); restart from stage 0.
             $resumeIndex = 0
@@ -1054,90 +1187,65 @@ function Invoke-FileAnalysis {
         if ($resumeIndex -le 0) {
             $userContent = "CODE:`n$code"
             if ($schema) { $userContent += "`n`nSCHEMA (DDL):`n$schema" }
-            $sanitized = Invoke-Stage -AgentName $StageAgents[0] -SystemPrompt $SanitizerSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[0] -Content $sanitized
-            $state.last_completed_stage = $StageAgents[0]; $state.updated_at = Get-UtcNowStamp
+            $sanitized = Invoke-Stage -AgentName $SanitizerStageName -SystemPrompt $SanitizerSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $SanitizerStageName -Content $sanitized
+            $state.last_completed_stage = $SanitizerStageName; $state.updated_at = Get-UtcNowStamp
             Save-State -StateFileRelative $Entry.state_file -State $state
         }
 
-        if ($resumeIndex -le 1) {
-            $domain = Invoke-Stage -AgentName $StageAgents[1] -SystemPrompt $BusinessDomainSystemPrompt -UserContent "SANITISED CODE CONTEXT:`n$sanitized" -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[1] -Content $domain
-            $state.last_completed_stage = $StageAgents[1]; $state.updated_at = Get-UtcNowStamp
+        # Uniform middle stages (business_domain_extractor through
+        # narrative_writer): each composes its declared inputs from
+        # $sanitized/$results, calls the model once, saves the intermediate,
+        # and optionally writes a named sibling output file (diagram.mmd,
+        # <file>.md). See pipeline_stages.ps1 for what each stage actually
+        # consumes - adding a stage here means adding one entry there, not
+        # another hand-written block like this used to be, one per stage.
+        for ($i = 0; $i -lt $PipelineStages.Count; $i++) {
+            $stage = $PipelineStages[$i]
+            if ($resumeIndex -gt ($i + 1)) { continue }
+
+            $parts = foreach ($inputSpec in $stage.Inputs) {
+                $value = if ($inputSpec.Stage -eq $SanitizerStageName) { $sanitized } else { $results[$inputSpec.Stage] }
+                "$($inputSpec.Label):`n$value"
+            }
+            $userContent = $parts -join "`n`n"
+
+            $systemPrompt = Get-Variable -Name $stage.SystemPromptVar -ValueOnly
+            $output = Invoke-Stage -AgentName $stage.Name -SystemPrompt $systemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+            Save-Intermediate -OutDir $outDir -AgentName $stage.Name -Content $output
+            $results[$stage.Name] = $output
+            $state.last_completed_stage = $stage.Name; $state.updated_at = Get-UtcNowStamp
             Save-State -StateFileRelative $Entry.state_file -State $state
+            if ($stage.SiblingOutput) {
+                $siblingName = & $stage.SiblingOutput $leafName
+                Write-Utf8NoBom -Path (Join-Path $outDir $siblingName) -Content (Remove-CodeFence $output)
+            }
         }
 
-        if ($resumeIndex -le 2) {
-            $userContent = "SANITISED CODE CONTEXT:`n$sanitized`n`nBUSINESS DOMAIN SUMMARY:`n$domain"
-            $structure = Invoke-Stage -AgentName $StageAgents[2] -SystemPrompt $StructuralMapperSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[2] -Content $structure
-            $state.last_completed_stage = $StageAgents[2]; $state.updated_at = Get-UtcNowStamp
-            Save-State -StateFileRelative $Entry.state_file -State $state
-        }
-
-        if ($resumeIndex -le 3) {
-            $userContent = "SANITISED CODE CONTEXT:`n$sanitized`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS DOMAIN SUMMARY:`n$domain"
-            $logic = Invoke-Stage -AgentName $StageAgents[3] -SystemPrompt $BusinessLogicSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[3] -Content $logic
-            $state.last_completed_stage = $StageAgents[3]; $state.updated_at = Get-UtcNowStamp
-            Save-State -StateFileRelative $Entry.state_file -State $state
-        }
-
-        if ($resumeIndex -le 4) {
-            $userContent = "SANITISED CODE CONTEXT:`n$sanitized`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic"
-            $security = Invoke-Stage -AgentName $StageAgents[4] -SystemPrompt $SecuritySystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[4] -Content $security
-            $state.last_completed_stage = $StageAgents[4]; $state.updated_at = Get-UtcNowStamp
-            Save-State -StateFileRelative $Entry.state_file -State $state
-        }
-
-        if ($resumeIndex -le 5) {
-            $userContent = "STRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic"
-            $performance = Invoke-Stage -AgentName $StageAgents[5] -SystemPrompt $PerformanceSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[5] -Content $performance
-            $state.last_completed_stage = $StageAgents[5]; $state.updated_at = Get-UtcNowStamp
-            Save-State -StateFileRelative $Entry.state_file -State $state
-        }
-
-        if ($resumeIndex -le 6) {
-            $userContent = "STRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic"
-            $testing = Invoke-Stage -AgentName $StageAgents[6] -SystemPrompt $TestValidationSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[6] -Content $testing
-            $state.last_completed_stage = $StageAgents[6]; $state.updated_at = Get-UtcNowStamp
-            Save-State -StateFileRelative $Entry.state_file -State $state
-        }
-
-        if ($resumeIndex -le 7) {
-            $userContent = "BUSINESS DOMAIN:`n$domain`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic`n`nSECURITY FINDINGS:`n$security`n`nPERFORMANCE FINDINGS:`n$performance`n`nTEST VALIDATION FINDINGS:`n$testing"
-            $diagram = Invoke-Stage -AgentName $StageAgents[7] -SystemPrompt $DiagramSystemPrompt -UserContent $userContent -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-            Save-Intermediate -OutDir $outDir -AgentName $StageAgents[7] -Content $diagram
-            $state.last_completed_stage = $StageAgents[7]; $state.updated_at = Get-UtcNowStamp
-            Save-State -StateFileRelative $Entry.state_file -State $state
-            Write-Utf8NoBom -Path (Join-Path $outDir "diagram.mmd") -Content (Remove-CodeFence $diagram)
-        }
-
-        # Stage 9: final synthesis
+        # Final synthesis (architecture_spec_writer): the one stage whose
+        # output is parsed/repaired/validated as JSON and decides completion
+        # vs. blocking - genuinely one-of-a-kind, stays hand-written.
+        $domain = $results['business_domain_extractor']
+        $structure = $results['source_ast_structural_mapper']
+        $logic = $results['business_logic_extractor']
+        $security = $results['security_compliance_analyst']
+        $performance = $results['performance_scalability_analyst']
+        $testing = $results['test_validation_analyst']
         $finalContext = "FILE PATH: $relativePath`n`nBUSINESS DOMAIN:`n$domain`n`nSTRUCTURAL BREAKDOWN:`n$structure`n`nBUSINESS LOGIC:`n$logic`n`nSECURITY FINDINGS:`n$security`n`nPERFORMANCE FINDINGS:`n$performance`n`nTEST VALIDATION FINDINGS:`n$testing"
         if ($finalContext.Length -gt $MaxFinalContextChars) {
             throw "[architecture_spec_writer] Chained context too large: $($finalContext.Length) chars > MaxFinalContextChars=$MaxFinalContextChars"
         }
-        $rawReport = Invoke-Stage -AgentName $StageAgents[8] -SystemPrompt $ArchitectureSpecSystemPrompt -UserContent $finalContext -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
-        Save-Intermediate -OutDir $outDir -AgentName $StageAgents[8] -Content $rawReport
+        $rawReport = Invoke-Stage -AgentName $FinalSynthesisStageName -SystemPrompt $ArchitectureSpecSystemPrompt -UserContent $finalContext -ModelName $ModelName -State $state -DeadlineUtc $fileDeadlineUtc
+        Save-Intermediate -OutDir $outDir -AgentName $FinalSynthesisStageName -Content $rawReport
 
         $outputRefs = @()
         try {
-            $parsed = (Remove-CodeFence $rawReport) | ConvertFrom-Json
+            $parsed = (Repair-JsonTruncation (Repair-JsonEscapes (Remove-CodeFence $rawReport))) | ConvertFrom-Json
             $parsed.module_metadata.file_path = $relativePath
             $reportFileName = "$leafName.json"
             $reportPath = Join-Path $outDir $reportFileName
             Write-Utf8NoBom -Path $reportPath -Content (($parsed | ConvertTo-Json -Depth 10) + "`n")
             $outputRefs += ".analysis-state/outputs/$outRelPosix/$reportFileName"
-            if ($parsed.markdown_report) {
-                $mdFileName = "$leafName.md"
-                $mdPath = Join-Path $outDir $mdFileName
-                Write-Utf8NoBom -Path $mdPath -Content $parsed.markdown_report
-                $outputRefs += ".analysis-state/outputs/$outRelPosix/$mdFileName"
-            }
             $state.status = "completed"
             $state.next_action = "none"
         }
@@ -1151,10 +1259,13 @@ function Invoke-FileAnalysis {
             $state.next_action = "retry_from_architecture_spec_writer"
         }
 
-        if (Test-Path -LiteralPath (Join-Path $outDir "diagram.mmd")) {
-            $outputRefs += ".analysis-state/outputs/$outRelPosix/diagram.mmd"
+        foreach ($stage in $PipelineStages | Where-Object { $_.SiblingOutput }) {
+            $siblingName = & $stage.SiblingOutput $leafName
+            if (Test-Path -LiteralPath (Join-Path $outDir $siblingName)) {
+                $outputRefs += ".analysis-state/outputs/$outRelPosix/$siblingName"
+            }
         }
-        $state.last_completed_stage = $StageAgents[8]
+        $state.last_completed_stage = $FinalSynthesisStageName
         $state.output_references = $outputRefs
         $state.updated_at = Get-UtcNowStamp
         Save-State -StateFileRelative $Entry.state_file -State $state
@@ -1218,45 +1329,16 @@ function Main {
         if (-not (Test-Path -LiteralPath $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
     }
 
-    $manifest = Read-Manifest
-    # @(...) forces an array even when exactly one item matches -- a bare
-    # PSCustomObject has no synthetic .Count (unlike int/string scalars),
-    # so an un-wrapped single-match result silently prints a blank Count.
-    $eligible = @($manifest.files | Where-Object { $_.status -in @("queued", "blocked", "in_progress") })
-
-    if ($WorkerCount -gt 1) {
-        if ($WorkerIndex -lt 0 -or $WorkerIndex -ge $WorkerCount) {
-            throw "WorkerIndex must be between 0 and WorkerCount-1 (got WorkerIndex=$WorkerIndex, WorkerCount=$WorkerCount)"
-        }
-        # Partition by a hash of each file's OWN path, not by its position in
-        # this array. manifest.json is shared and live: another worker can
-        # complete/block a file (changing its status, dropping it out of
-        # "eligible") between when that worker read the manifest and when
-        # this one does. Index-based partitioning (idx % WorkerCount) shifts
-        # every subsequent file's index whenever that happens, so two workers
-        # started with different manifest snapshots can end up computing
-        # different owners for the same file and both claim it -- confirmed
-        # in practice: worker A blocks a file and moves its state record to
-        # states/blocked/, while worker B's own (already-partitioned, now
-        # stale) copy still points at the old flat path and throws "Cannot
-        # find path ... does not exist" when it gets there. A hash of the
-        # path itself is invariant regardless of what any other file's status
-        # does in the meantime, so ownership never drifts between workers.
-        $eligible = @($eligible | Where-Object { (Get-PathWorkerHash -RelativePath $_.path) % $WorkerCount -eq $WorkerIndex })
-        Log "Worker $($WorkerIndex + 1) owns $($eligible.Count) of the eligible files." "Cyan"
+    if ($WorkerCount -gt 1 -and ($WorkerIndex -lt 0 -or $WorkerIndex -ge $WorkerCount)) {
+        throw "WorkerIndex must be between 0 and WorkerCount-1 (got WorkerIndex=$WorkerIndex, WorkerCount=$WorkerCount)"
     }
-
-    if ($eligible.Count -eq 0) {
-        Log "Nothing to process: no queued/blocked/in_progress files in the manifest." "Green"
-        return
-    }
-
-    $toProcess = $eligible
-    if ($Limit -gt 0) { $toProcess = @($eligible | Select-Object -First $Limit) }
 
     if ($DryRun) {
-        Log "Would process $($toProcess.Count) file(s) (of $($eligible.Count) eligible):" "Cyan"
-        foreach ($entry in $toProcess) {
+        $manifest = Read-Manifest
+        $eligible = @($manifest.files | Where-Object { $_.status -in @("queued", "blocked", "in_progress") })
+        $preview = if ($Limit -gt 0) { @($eligible | Select-Object -First $Limit) } else { $eligible }
+        Log "Would process $($preview.Count) file(s) (of $($eligible.Count) eligible in the shared queue):" "Cyan"
+        foreach ($entry in $preview) {
             $resumeNote = if ($entry.last_completed_stage) { "resume after $($entry.last_completed_stage)" } else { "start from stage 1" }
             Log "  [$($entry.status)] $($entry.path) -- $resumeNote"
         }
@@ -1269,24 +1351,32 @@ function Main {
 
     $modelName = $Model
     Log "Using model: $modelName" "Cyan"
-    Log "Processing $($toProcess.Count) file(s) of $($eligible.Count) eligible ..." "Cyan"
+    Log "Pulling files from the shared queue as they become available (no fixed partition -- an idle worker helps with whatever's left instead of stopping once its own slice is done)." "Cyan"
 
-    $i = 0
-    foreach ($entry in $toProcess) {
-        $i++
-        Log "[$i/$($toProcess.Count)] $($entry.path)" "Yellow"
-        Invoke-FileAnalysis -Manifest $manifest -Entry $entry -ModelName $modelName
-        Save-Manifest -Manifest $manifest -UpdatedPath $entry.path
+    # No fixed per-worker slice: each iteration atomically claims whichever
+    # eligible file is next in the shared manifest (see Request-NextFile), so a
+    # worker that finishes faster than its peers -- a smaller file, a faster
+    # GPU, or simply finishing earlier -- immediately picks up more of THEIR
+    # remaining work instead of exiting while they're still busy.
+    $processedCount = 0
+    while ($Limit -le 0 -or $processedCount -lt $Limit) {
+        $claim = Request-NextFile -StaleSeconds $StaleInProgressSeconds
+        if (-not $claim) {
+            if ($processedCount -eq 0) { Log "Nothing to process: no queued/blocked/in_progress files in the manifest." "Green" }
+            break
+        }
+        $processedCount++
+        Log "[claimed $processedCount] $($claim.Entry.path)" "Yellow"
+        Invoke-FileAnalysis -Manifest $claim.Manifest -Entry $claim.Entry -ModelName $modelName
+        Save-Manifest -Manifest $claim.Manifest -UpdatedPath $claim.Entry.path
     }
 
-    # Re-read from disk for the summary: with concurrent workers, this
-    # process's in-memory manifest only reflects its own partition.
     $finalManifest = Read-Manifest
     $completed = @($finalManifest.files | Where-Object { $_.status -eq "completed" }).Count
     $blocked = @($finalManifest.files | Where-Object { $_.status -eq "blocked" }).Count
     Log ""
     Log "--- Run summary ---"
-    Log "Processed this run : $($toProcess.Count)"
+    Log "Processed this run : $processedCount"
     Log "Completed (total)  : $completed"
     Log "Blocked (total)    : $blocked"
     Log ""

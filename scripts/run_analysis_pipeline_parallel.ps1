@@ -5,9 +5,12 @@
 # migration), so each worker gets its own dedicated `ollama serve` instance
 # on its own port, started by this script before any workers launch. Each
 # worker is then its own background job (a real child process, so the
-# workers make concurrent HTTP calls without blocking each other) with a
-# distinct -WorkerIndex/-WorkerCount pair, so run_analysis_pipeline.ps1's
-# own partitioning keeps the workers from picking up the same file, and its
+# workers make concurrent HTTP calls without blocking each other). There is
+# no fixed per-worker slice of the queue: every worker atomically claims its
+# next file from the shared manifest as it goes (run_analysis_pipeline.ps1's
+# Request-NextFile), so a worker that finishes faster than its peers -- a
+# smaller file, a faster GPU, or just finishing earlier -- immediately helps
+# with whatever they haven't gotten to yet instead of exiting; its
 # merge-safe Save-Manifest keeps their progress writes from clobbering each
 # other. This script just bootstraps the instances, launches, streams, and
 # waits.
@@ -28,6 +31,15 @@
 #   .\run_analysis_pipeline_parallel.ps1 -NoAutoStart
 #       # skip the Ollama instance bootstrap below and assume both ports
 #       # already have a dedicated instance running.
+#   .\run_analysis_pipeline_parallel.ps1 -StaggerSeconds 30
+#       # wait longer between launching each worker (default 15s) -- give
+#       # this more room if manifest.json keeps growing and 15s stops being
+#       # enough gap between workers' startup Read-Manifest calls.
+#   .\run_analysis_pipeline_parallel.ps1 -WorkerRestartDelaySeconds 60 -MaxWorkerRestarts 5
+#       # if a worker's job dies outright (crashed host process), relaunch
+#       # it with the same partition after this long, up to this many times
+#       # per worker, instead of leaving that partition unworked for the
+#       # rest of the run.
 
 param(
     [int]$Limit = 0,
@@ -52,7 +64,30 @@ param(
     [int]$PollSeconds = 2,
     [int]$EtaEverySeconds = 60,
     [switch]$NoAutoStart,
-    [int]$HeartbeatSeconds = 5
+    [int]$HeartbeatSeconds = 5,
+    # Delay between launching each worker. Without this, all workers call
+    # Read-Manifest (a full JSON parse/reserialize of manifest.json, which
+    # grows into the tens of MB over a long run) within the same instant at
+    # startup -- confirmed in practice as the trigger for a worker's host
+    # powershell.exe process dying with a raw clr.dll access violation
+    # (0xc0000005) before it even printed its first log line. Staggering
+    # the launches spreads that one-time heavy parse out instead of letting
+    # every worker hit it simultaneously.
+    [int]$StaggerSeconds = 15,
+    # If a worker's job dies outright (its host powershell.exe process
+    # crashed -- the clr.dll access violation case, or anything else that
+    # takes the whole process down rather than surfacing as a normal
+    # PowerShell error), relaunch it with the same -WorkerIndex/-WorkerCount
+    # partition after this many seconds instead of leaving that partition
+    # permanently unworked for the rest of the run. Mirrors the wait-then-
+    # restart pattern run_analysis_pipeline.ps1 already uses for a crashed
+    # Ollama instance (-OllamaDownWaitSeconds).
+    [int]$WorkerRestartDelaySeconds = 30,
+    # Cap on relaunches per worker, so a deterministic/repeating crash (e.g.
+    # a genuinely too-large manifest.json) can't loop forever burning GPU
+    # time instead of ever finishing -- it gives up and reports Failed after
+    # this many restarts, same as before this feature existed.
+    [int]$MaxWorkerRestarts = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -153,6 +188,14 @@ if (-not $NoAutoStart -and -not $DryRun) {
 Write-Host "Launching $workerCount worker(s), one per GPU:" -ForegroundColor Cyan
 for ($i = 0; $i -lt $workerCount; $i++) { Write-Host "  [$i] $Model on $($WorkerUrls[$i]) (CUDA_VISIBLE_DEVICES=$($CudaDevices[$i]))" }
 
+function Start-Worker {
+    param([int]$Index, [hashtable]$WorkerParams)
+    return Start-Job -Name "analysis-worker-$Index" -ScriptBlock {
+        param($ScriptPath, $ParamsTable)
+        & $ScriptPath @ParamsTable
+    } -ArgumentList $WorkerScript, $WorkerParams
+}
+
 $jobEntries = @()
 for ($i = 0; $i -lt $workerCount; $i++) {
     $workerParams = @{
@@ -171,17 +214,24 @@ for ($i = 0; $i -lt $workerCount; $i++) {
         WorkerCount           = $workerCount
         HeartbeatSeconds      = $HeartbeatSeconds
     }
-    $job = Start-Job -Name "analysis-worker-$i" -ScriptBlock {
-        param($ScriptPath, $ParamsTable)
-        & $ScriptPath @ParamsTable
-    } -ArgumentList $WorkerScript, $workerParams
+    $job = Start-Worker -Index $i -WorkerParams $workerParams
 
     $jobEntries += [pscustomobject]@{
-        Index     = $i
-        Model     = $Model
-        Job       = $job
-        LastState = $job.State
-        Drained   = $false
+        Index          = $i
+        Model          = $Model
+        BaseUrl        = $WorkerUrls[$i]
+        CudaDevice     = $CudaDevices[$i]
+        WorkerParams   = $workerParams
+        Job            = $job
+        LastState      = $job.State
+        Drained        = $false
+        RestartCount   = 0
+        PendingRetryAt = $null
+        GaveUp         = $false
+    }
+
+    if ($StaggerSeconds -gt 0 -and $i -lt $workerCount - 1) {
+        Start-Sleep -Seconds $StaggerSeconds
     }
 }
 
@@ -234,6 +284,14 @@ function Drain-JobOutput {
                 $reason = $entry.Job.ChildJobs[0].JobStateInfo.Reason
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 Write-Host "[$timestamp] [Worker $($entry.Index + 1)] job $($entry.Job.State)$(if ($reason) { ": $reason" })" -ForegroundColor Red
+                if ($entry.RestartCount -lt $MaxWorkerRestarts) {
+                    $entry.PendingRetryAt = (Get-Date).AddSeconds($WorkerRestartDelaySeconds)
+                    Write-Host "[$timestamp] [Worker $($entry.Index + 1)] will relaunch its partition in ${WorkerRestartDelaySeconds}s (restart $($entry.RestartCount + 1)/$MaxWorkerRestarts)" -ForegroundColor Yellow
+                }
+                else {
+                    $entry.GaveUp = $true
+                    Write-Host "[$timestamp] [Worker $($entry.Index + 1)] giving up -- already relaunched $MaxWorkerRestarts time(s); its remaining partition is left queued/blocked for a future run" -ForegroundColor Red
+                }
             }
             $entry.LastState = $entry.Job.State
         }
@@ -242,11 +300,48 @@ function Drain-JobOutput {
     }
 }
 
+# Relaunches any worker whose job died and whose retry delay has elapsed, on
+# its original -OllamaUrl/-CudaDevice. There's no partition to hand back --
+# workers pull from the shared manifest as they go (Request-NextFile in
+# run_analysis_pipeline.ps1), so the relaunched process just resumes claiming
+# from wherever the queue stands, including its own now-stale in_progress
+# file once that goes past -StaleInProgressSeconds. Only re-verifies/restarts
+# the Ollama instance first when this script is managing instances at all
+# (-NoAutoStart means "assume something else owns that lifecycle").
+function Restart-DeadWorkers {
+    param($Entries)
+    foreach ($entry in $Entries) {
+        if (-not $entry.PendingRetryAt) { continue }
+        if ($entry.Job.State -eq "Running") { $entry.PendingRetryAt = $null; continue }
+        if ((Get-Date) -lt $entry.PendingRetryAt) { continue }
+
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Write-Host "[$timestamp] [Worker $($entry.Index + 1)] relaunching ..." -ForegroundColor Yellow
+        Remove-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
+
+        if (-not $NoAutoStart -and -not $DryRun) {
+            Start-OllamaInstanceIfNeeded -BaseUrl $entry.BaseUrl -CudaDevice $entry.CudaDevice -ModelsPath $OllamaModelsPath -ModelKey $entry.Model
+        }
+
+        $entry.Job = Start-Worker -Index $entry.Index -WorkerParams $entry.WorkerParams
+        $entry.LastState = $entry.Job.State
+        $entry.Drained = $false
+        $entry.RestartCount++
+        $entry.PendingRetryAt = $null
+    }
+}
+
 $etaScript = Join-Path $PSScriptRoot "queue_eta.ps1"
 $lastEtaAt = Get-Date
 
-while (@($jobEntries | Where-Object { $_.Job.State -eq "Running" }).Count -gt 0) {
+function Test-WorkerStillActive {
+    param($Entry)
+    return $Entry.Job.State -eq "Running" -or ($Entry.PendingRetryAt -and -not $Entry.GaveUp)
+}
+
+while (@($jobEntries | Where-Object { Test-WorkerStillActive $_ }).Count -gt 0) {
     Drain-JobOutput -Entries $jobEntries
+    Restart-DeadWorkers -Entries $jobEntries
 
     if (-not $DryRun -and (Test-Path -LiteralPath $ManifestPath) -and
         ((Get-Date) - $lastEtaAt).TotalSeconds -ge $EtaEverySeconds) {
@@ -265,10 +360,14 @@ Write-Host "--- Parallel run summary ---" -ForegroundColor Cyan
 $anyFailed = $false
 foreach ($entry in $jobEntries) {
     $state = $entry.Job.State
-    Write-Host "  Worker $($entry.Index + 1) ($($entry.Model)): $state"
+    $restartNote = if ($entry.RestartCount -gt 0) { " (restarted $($entry.RestartCount)x)" } else { "" }
+    Write-Host "  Worker $($entry.Index + 1) ($($entry.Model)): $state$restartNote"
     if ($state -eq "Failed") {
         $anyFailed = $true
         Write-Host "    $($entry.Job.ChildJobs[0].JobStateInfo.Reason)" -ForegroundColor Red
+        if ($entry.GaveUp) {
+            Write-Host "    gave up after $MaxWorkerRestarts restart(s) -- rerun this script to pick up its remaining partition" -ForegroundColor Red
+        }
     }
     Remove-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
 }

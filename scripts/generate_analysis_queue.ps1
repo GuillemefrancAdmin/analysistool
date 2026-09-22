@@ -43,18 +43,10 @@ $ExcludedDirs = @(
 
 $SpecialFileNames = @("env.inc", "global.config.php", "dsn.html", "dsnmssql.html")
 
-$AgentNames = @(
-    "file_queue_orchestrator_agent",
-    "sanitizer_context_ingestion_agent",
-    "business_domain_extractor",
-    "source_ast_structural_mapper",
-    "business_logic_extractor",
-    "security_compliance_analyst",
-    "performance_scalability_analyst",
-    "test_validation_analyst",
-    "diagram_designer_context_visualizer",
-    "architecture_spec_writer"
-)
+# The stage roster lives in one shared file so this script and
+# run_analysis_pipeline.ps1 can't drift out of sync with each other.
+. (Join-Path $PSScriptRoot "pipeline_stages.ps1")
+$AgentNames = Get-AllAgentNames
 
 function Get-UtcNowStamp {
     return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -194,15 +186,7 @@ function Get-StateNameMap {
 function Get-EmptyAgentUsage {
     $usage = [ordered]@{}
     foreach ($agentName in $AgentNames) {
-        $usage[$agentName] = [ordered]@{
-            model_name        = ""
-            started_at        = $null
-            ended_at          = $null
-            elapsed_seconds   = 0
-            prompt_tokens     = 0
-            completion_tokens = 0
-            total_tokens      = 0
-        }
+        $usage[$agentName] = New-EmptyAgentUsage
     }
     return $usage
 }
@@ -222,18 +206,14 @@ function Get-AgentSummary {
     param($ExistingAgents, [string]$AgentName)
     $existing = $null
     if ($ExistingAgents) { $existing = $ExistingAgents.($AgentName) }
-    $summary = [ordered]@{
-        model_name      = ""
-        started_at      = $null
-        ended_at        = $null
-        elapsed_seconds = 0
-        total_tokens    = 0
-    }
+    $summary = New-EmptyAgentUsage
     if ($existing) {
         if ($null -ne $existing.model_name) { $summary.model_name = $existing.model_name }
         if ($null -ne $existing.started_at) { $summary.started_at = $existing.started_at }
         if ($null -ne $existing.ended_at) { $summary.ended_at = $existing.ended_at }
         if ($null -ne $existing.elapsed_seconds) { $summary.elapsed_seconds = $existing.elapsed_seconds }
+        if ($null -ne $existing.prompt_tokens) { $summary.prompt_tokens = $existing.prompt_tokens }
+        if ($null -ne $existing.completion_tokens) { $summary.completion_tokens = $existing.completion_tokens }
         if ($null -ne $existing.total_tokens) { $summary.total_tokens = $existing.total_tokens }
     }
     return $summary

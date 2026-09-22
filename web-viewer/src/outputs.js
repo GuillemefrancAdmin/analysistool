@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { resolveOutputReferences } = require('./manifest');
 
 // Categorizes an entry's output_references (relative paths from the project
 // root, e.g. ".analysis-state/outputs/GESACAD/cobol/x.scb.json") by kind, and
@@ -8,7 +9,7 @@ const path = require('path');
 // some of these present (analysis-state-persistence: "Output artifacts kept
 // self-contained per file").
 function loadOutputs(projectRoot, entry) {
-  const refs = Array.isArray(entry && entry.output_references) ? entry.output_references : [];
+  const refs = entry ? resolveOutputReferences(projectRoot, entry) : [];
   const result = { json: null, jsonError: null, markdown: null, diagram: null, raw: null };
 
   for (const ref of refs) {
