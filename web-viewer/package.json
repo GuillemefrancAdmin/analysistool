@@ -1,0 +1,17 @@
+{
+  "name": "analysistool-web-viewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local web viewer for browsing and searching legacy source analysis outputs under .analysis-state/",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.1",
+    "express": "^4.21.1",
+    "marked": "^14.1.3",
+    "mermaid": "^11.4.0",
+    "minisearch": "^7.1.1"
+  }
+}

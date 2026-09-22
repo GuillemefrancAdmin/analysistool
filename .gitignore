@@ -13,3 +13,6 @@ desktop.ini
 
 # Logs
 *.log
+
+# Web viewer runtime deps
+web-viewer/node_modules/
