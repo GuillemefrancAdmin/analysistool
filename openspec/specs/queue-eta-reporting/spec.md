@@ -15,11 +15,11 @@ The ETA reporter SHALL compute the average recorded total elapsed seconds across
 - **THEN** the reporter computes the average elapsed time across all such files and uses it as the base per-file estimate
 
 ### Requirement: Stage-fraction proration for in-flight files
-For a remaining file that already has a recorded `last_completed_stage`, the reporter SHALL prorate its estimate to only the fraction of the nine stages not yet completed, rather than charging the full per-file average.
+For a remaining file that already has a recorded `last_completed_stage`, the reporter SHALL prorate its estimate to only the fraction of the ten stages not yet completed, rather than charging the full per-file average.
 
 #### Scenario: File is partway through the chain
-- **WHEN** a queued or blocked file's `last_completed_stage` is the 3rd of 9 stages
-- **THEN** its remaining-time estimate is 6/9 of the average per-file duration, not the full average
+- **WHEN** a queued or blocked file's `last_completed_stage` is the 3rd of 10 stages
+- **THEN** its remaining-time estimate is 7/10 of the average per-file duration, not the full average
 
 ### Requirement: Worker-divided completion estimate
 The reporter SHALL divide the total remaining estimated seconds by the effective worker count (`-Workers`, minimum 1) to produce the reported ETA and estimated completion timestamps (UTC and local).

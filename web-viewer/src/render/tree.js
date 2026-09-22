@@ -14,8 +14,10 @@ function statusBadge(status) {
 }
 
 // Renders the nav tree built by src/tree.js as nested <ul> markup, mirroring
-// the analyzed source folder layout (output-web-viewer "Navigation mirrors
-// the analyzed source tree"). `activePath` highlights the currently open file.
+// the analyzed output folder layout (output-web-viewer "Navigation mirrors
+// the analyzed source tree"). `activePath` highlights the currently open
+// file. Folders use <details>/<summary> so they can be expanded/collapsed
+// natively, no JS required; all start collapsed, regardless of activePath.
 function renderTree(node, activePath) {
   const folderNames = Array.from(node.children.keys()).sort((a, b) => a.localeCompare(b));
   if (folderNames.length === 0) return '';
@@ -27,9 +29,21 @@ function renderTree(node, activePath) {
       const href = `/file?path=${encodeURIComponent(entry.path)}`;
       return `<li><a href="${href}"${cls}>${escapeHtml(name)}</a> ${statusBadge(entry.status)}</li>`;
     }
-    return `<li><span class="folder">${escapeHtml(name)}</span>${renderTree(child, activePath)}</li>`;
+    return `<li><details><summary class="folder">${escapeHtml(name)}</summary>${renderTree(child, activePath)}</details></li>`;
   });
   return `<ul class="tree">${items.join('')}</ul>`;
 }
 
-module.exports = { renderTree, statusBadge };
+// Full sidebar markup: the filter textbox (wired up client-side by the
+// script in render/layout.js's page()) plus the tree itself. Shared by
+// routes/overview.js and routes/file.js so both stay in sync.
+function sidebarHtml(tree, activePath) {
+  return `
+    <aside class="sidebar">
+      <h3>Files</h3>
+      <input type="search" class="tree-filter" placeholder="Filter files..." aria-label="Filter files by name">
+      ${renderTree(tree, activePath)}
+    </aside>`;
+}
+
+module.exports = { renderTree, sidebarHtml, statusBadge };

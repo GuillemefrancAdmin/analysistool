@@ -1,7 +1,7 @@
 const express = require('express');
 const { loadManifest, statusCounts } = require('../manifest');
 const { buildTree } = require('../tree');
-const { renderTree, statusBadge } = require('../render/tree');
+const { sidebarHtml, statusBadge } = require('../render/tree');
 const { page, escapeHtml } = require('../render/layout');
 
 function overviewRouter(analysisStateDir) {
@@ -42,10 +42,7 @@ function overviewRouter(analysisStateDir) {
 
     const body = `
       <div class="layout-with-sidebar">
-        <aside class="sidebar">
-          <h3>Files</h3>
-          ${renderTree(tree, null)}
-        </aside>
+        ${sidebarHtml(tree, null)}
         <div class="content">
           <h1>Overview</h1>
           <div class="stat-row">${summary}</div>
