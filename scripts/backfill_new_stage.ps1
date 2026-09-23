@@ -1,16 +1,30 @@
-# Propagates a newly-added pipeline stage across files that already
-# completed the full chain before that stage existed - the operation
-# add-narrative-writer-agent performed by hand (twice, hitting a BOM bug and
-# a missing-fields bug along the way) when narrative_writer was added.
+# Rewinds already-"completed" files to just before -NewStageName so the next
+# pipeline run re-executes that one stage, reusing every earlier stage's
+# saved intermediate rather than reprocessing from scratch. Two distinct
+# uses:
 #
-# For every manifest entry with status "completed" that has no recorded
-# usage yet for -NewStageName, this rewinds last_completed_stage (in both
-# its state file and its manifest entry) to the stage immediately preceding
-# the new one in the shared registry, sets status back to "queued", and
-# zeroes its run-total counters - so the next pipeline run naturally resumes
-# each file right at the new stage, reusing every earlier stage's saved
-# intermediate rather than reprocessing from scratch. Per-agent history for
-# stages before the rewind point is left exactly as recorded.
+#   1. Propagating a newly-added stage across files that completed the full
+#      chain before that stage existed - the operation add-narrative-writer-
+#      agent performed by hand (twice, hitting a BOM bug and a missing-fields
+#      bug along the way) when narrative_writer was added. By default, only
+#      files with no recorded usage yet for -NewStageName are matched.
+#
+#   2. Force re-running a stage whose PROMPT/behavior changed after files
+#      already completed it once (e.g. fix-architecture-spec-synthesis: the
+#      final-synthesis prompt was fixed after 1,578 files had already run it
+#      with the old, buggy prompt). Pass -EvenIfAlreadyRun to match every
+#      "completed" file regardless of whether -NewStageName already has a
+#      recorded result for it - the default match-only-if-never-run
+#      condition would otherwise select nothing, since every file already
+#      has *a* result for that stage, just a low-quality one.
+#
+# Either way, this rewinds last_completed_stage (in both the state file and
+# the manifest entry) to the stage immediately preceding -NewStageName in
+# the shared registry, sets status back to "queued", and zeroes the file's
+# run-total counters. Per-agent history for stages before the rewind point -
+# including -NewStageName's own now-stale entry under -EvenIfAlreadyRun - is
+# left exactly as recorded until that stage actually reruns and overwrites
+# its own entry.
 #
 # Safe to run while other files are still being actively processed: matched
 # files are, by definition, already "completed" (a live worker only holds
@@ -23,11 +37,58 @@
 #       # report-only: prints how many files would be touched, writes nothing
 #   .\backfill_new_stage.ps1 -NewStageName narrative_writer -Force
 #       # actually performs the rewind
+#   .\backfill_new_stage.ps1 -NewStageName architecture_spec_writer -EvenIfAlreadyRun
+#       # report-only: force-rewind mode, matches every completed file
+#   .\backfill_new_stage.ps1 -NewStageName architecture_spec_writer -EvenIfAlreadyRun -Force
+#       # actually re-queues every completed file for that stage alone
 
 param(
     [Parameter(Mandatory = $true)][string]$NewStageName,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$EvenIfAlreadyRun
 )
+
+# Relaunch under PowerShell 7 when available -- see the matching block in
+# run_analysis_pipeline_parallel.ps1 for why (Windows PowerShell 5.1's
+# ConvertFrom-Json can't reliably parse manifest.json once it grows large,
+# and this script reads/rewrites the whole thing).
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+    if (-not $pwshExe) {
+        $pwshExe = @(
+            "$env:ProgramFiles\PowerShell\7\pwsh.exe"
+            "$env:LOCALAPPDATA\Programs\PowerShell-7.6.6\pwsh.exe"
+        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    }
+    if ($pwshExe) {
+        # Forwarded via a small JSON bootstrap file + hashtable splat, not raw
+        # -File command-line args: confirmed by testing that -File's own
+        # argument parsing silently mangles array-typed parameters (space-
+        # separated values drop everything after the first element; a single
+        # comma-joined token doesn't get re-split into an array either).
+        # JSON round-trips every bound parameter -- arrays, switches, scalars
+        # -- exactly, then a real hashtable splat binds them correctly.
+        $paramsForward = @{}
+        foreach ($key in $PSBoundParameters.Keys) {
+            $val = $PSBoundParameters[$key]
+            if ($val -is [switch]) { $paramsForward[$key] = [bool]$val.IsPresent }
+            else { $paramsForward[$key] = $val }
+        }
+        $bootstrapPath = [System.IO.Path]::GetTempFileName()
+        $exitCode = 1
+        try {
+            ($paramsForward | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8
+            $cmd = "`$h = Get-Content -LiteralPath '$bootstrapPath' -Raw | ConvertFrom-Json -AsHashtable; & '$PSCommandPath' @h"
+            & $pwshExe -NoProfile -Command $cmd
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
+        }
+        exit $exitCode
+    }
+    Write-Host "WARNING: pwsh.exe (PowerShell 7) not found -- continuing under Windows PowerShell 5.1, which cannot reliably parse a large manifest.json." -ForegroundColor Yellow
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -40,14 +101,38 @@ $ManifestPath = Join-Path $StateRoot "queue\manifest.json"
 function Write-Utf8NoBom {
     param([string]$Path, [string]$Content)
     $encoding = New-Object System.Text.UTF8Encoding($false)
-    $tempPath = "$Path.tmp-$PID"
-    [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
-    if (Test-Path -LiteralPath $Path) {
-        $backupPath = "$Path.bak-$PID"
-        [System.IO.File]::Replace($tempPath, $Path, $backupPath)
-        Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-    } else {
-        Move-Item -LiteralPath $tempPath -Destination $Path
+    # Verify-and-retry the whole write: confirmed in practice (twice, on
+    # manifest.json) that something external can inject a single stray
+    # character into an otherwise-correct write -- see the matching, more
+    # fully-commented version of this function in run_analysis_pipeline.ps1.
+    $maxWriteAttempts = 3
+    for ($writeAttempt = 1; $writeAttempt -le $maxWriteAttempts; $writeAttempt++) {
+        $tempPath = "$Path.tmp-$PID"
+        [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
+        if (Test-Path -LiteralPath $Path) {
+            $backupPath = "$Path.bak-$PID"
+            $maxReplaceAttempts = 5
+            for ($attempt = 1; $attempt -le $maxReplaceAttempts; $attempt++) {
+                try {
+                    [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+                    break
+                }
+                catch [System.IO.IOException] {
+                    if ($attempt -eq $maxReplaceAttempts) { throw }
+                    Start-Sleep -Milliseconds (100 * $attempt)
+                }
+            }
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        } else {
+            Move-Item -LiteralPath $tempPath -Destination $Path
+        }
+
+        $actualContent = [System.IO.File]::ReadAllText($Path, $encoding)
+        if ($actualContent -ceq $Content) { return }
+        if ($writeAttempt -eq $maxWriteAttempts) {
+            throw "Write-Utf8NoBom: content read back from '$Path' didn't match what was written, even after $maxWriteAttempts attempts -- something external is altering this file during/after write."
+        }
+        Start-Sleep -Milliseconds (150 * $writeAttempt)
     }
 }
 
@@ -80,7 +165,7 @@ try {
 
     $targets = $manifest.files | Where-Object {
         $_.status -eq "completed" -and
-        (-not $_.token_usage.agents.($NewStageName) -or -not $_.token_usage.agents.($NewStageName).model_name)
+        ($EvenIfAlreadyRun -or -not $_.token_usage.agents.($NewStageName) -or -not $_.token_usage.agents.($NewStageName).model_name)
     }
 
     Write-Host "Stage '$NewStageName' -> rewinding to '$precedingStageName'."

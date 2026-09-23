@@ -96,6 +96,49 @@ param(
     [int]$HeartbeatSeconds = 5
 )
 
+# Relaunch under PowerShell 7 when available -- see the matching block in
+# run_analysis_pipeline_parallel.ps1 for why (Windows PowerShell 5.1's
+# ConvertFrom-Json can't reliably parse manifest.json once it grows large).
+# A no-op when this is already running under PS7, including when launched
+# as a worker job by an already-relaunched orchestrator.
+if ($PSVersionTable.PSEdition -eq 'Desktop') {
+    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+    if (-not $pwshExe) {
+        $pwshExe = @(
+            "$env:ProgramFiles\PowerShell\7\pwsh.exe"
+            "$env:LOCALAPPDATA\Programs\PowerShell-7.6.6\pwsh.exe"
+        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    }
+    if ($pwshExe) {
+        # Forwarded via a small JSON bootstrap file + hashtable splat, not raw
+        # -File command-line args: confirmed by testing that -File's own
+        # argument parsing silently mangles array-typed parameters (space-
+        # separated values drop everything after the first element; a single
+        # comma-joined token doesn't get re-split into an array either).
+        # JSON round-trips every bound parameter -- arrays, switches, scalars
+        # -- exactly, then a real hashtable splat binds them correctly.
+        $paramsForward = @{}
+        foreach ($key in $PSBoundParameters.Keys) {
+            $val = $PSBoundParameters[$key]
+            if ($val -is [switch]) { $paramsForward[$key] = [bool]$val.IsPresent }
+            else { $paramsForward[$key] = $val }
+        }
+        $bootstrapPath = [System.IO.Path]::GetTempFileName()
+        $exitCode = 1
+        try {
+            ($paramsForward | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8
+            $cmd = "`$h = Get-Content -LiteralPath '$bootstrapPath' -Raw | ConvertFrom-Json -AsHashtable; & '$PSCommandPath' @h"
+            & $pwshExe -NoProfile -Command $cmd
+            $exitCode = $LASTEXITCODE
+        }
+        finally {
+            Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
+        }
+        exit $exitCode
+    }
+    Write-Host "WARNING: pwsh.exe (PowerShell 7) not found -- continuing under Windows PowerShell 5.1, which cannot reliably parse a large manifest.json." -ForegroundColor Yellow
+}
+
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
@@ -276,15 +319,17 @@ Output ONLY the Markdown narrative as plain prose and headings. No JSON, no fenc
 # call uses no response_format, just a plain-text JSON instruction, parsed
 # and validated by this script afterward.
 $ArchitectureSpecSystemPrompt = @'
-You are the Architecture & Spec Writer Agent, the final synthesis step of a legacy modernization pipeline. You receive: the file path, and the prior findings from the Business Domain, Structural, Business Logic, Security, Performance, and Test Validation agents for one legacy source module. Compile them into a single JSON object with EXACTLY this shape (all fields required; use empty string/array/false if genuinely unknown, never omit a key):
+You are the Architecture & Spec Writer Agent, the final synthesis step of a legacy modernization pipeline. You receive: the file path, and the prior findings from the Business Domain, Structural, Business Logic, Security, Performance, and Test Validation agents for one legacy source module. Compile them into a single JSON object with EXACTLY this shape (all fields required; use empty string/array/false if genuinely unknown, never omit a key).
+
+The shape below is a FORMAT TEMPLATE, not example content. Every angle-bracketed token like <string> or <short title> describes what kind of value belongs there -- it is never a literal value to copy into your output. Every array or object you emit must be built from the real findings given to you below. If a section genuinely has zero real findings, emit an empty array [], never an invented or template-derived entry.
 
 {
   "module_metadata": {"file_path": "", "programming_language": "", "language_version": "", "module_scope": "file|class|package|procedure|module|script", "primary_purpose": ""},
   "architectural_layer": {"primary_layer": "interaction|business_logic|data_access|configuration|infrastructure|cross_cutting", "layer_confidence_score": 0.0, "entry_points": [""], "state_management_pattern": "stateless|stateful_in_memory|database_backed|session_bound|global_mutable_state"},
   "quality_metrics": {"cyclomatic_complexity": 0, "maintainability_index": 0.0, "lines_of_code": 0, "comment_density_ratio": 0.0, "halstead_volume": 0.0, "composite_quality_score": 0.0},
-  "functional_requirements": ["REQ-ID | title | computation|validation|data_transformation|workflow_routing|authorization|audit_logging | line-range | short description"],
-  "technical_debt_and_code_smells": ["ISSUE-ID | deprecated_api|security_vulnerability|hardcoded_credentials|god_class_or_method|dead_code|tight_coupling|missing_error_handling|manual_deployment_dependency | critical|high|medium|low|informational | location | description | remediation"],
-  "dependencies_and_integrations": {"internal_module_dependencies": [""], "external_library_dependencies": ["name | version | deprecated(true/false) | eol status"], "database_interactions": ["TABLE | READ|WRITE|UPDATE|DELETE|SCHEMA_DDL|STORED_PROCEDURE_EXEC | mechanism"], "network_and_api_calls": [""], "integration_ceiling_risk": false},
+  "functional_requirements": [{"requirement_id": "<string, e.g. REQ-BL-001>", "title": "<short descriptive title>", "description": "<the business logic, formula, or conditional rule this requirement captures>", "business_rule_type": "computation|validation|data_transformation|workflow_routing|authorization|audit_logging", "source_line_range": "<start-end line numbers, e.g. 102-145>", "input_parameters": ["<data structure, argument, or env var this logic consumes>"], "output_artifacts": ["<return value, modified state, or external message this logic produces>"]}],
+  "technical_debt_and_code_smells": [{"issue_id": "<string, e.g. DEBT-SEC-004>", "category": "deprecated_api|security_vulnerability|hardcoded_credentials|god_class_or_method|dead_code|tight_coupling|missing_error_handling|manual_deployment_dependency", "severity": "critical|high|medium|low|informational", "source_location": "<symbol name or line range>", "description": "<why this is technical debt>", "remediation_strategy": "<recommended refactoring technique>"}],
+  "dependencies_and_integrations": {"internal_module_dependencies": [""], "external_library_dependencies": [{"library_name": "<string>", "version_constraint": "<string>", "is_deprecated": false, "end_of_life_status": "<string>"}], "database_interactions": [{"operation_type": "READ|WRITE|UPDATE|DELETE|SCHEMA_DDL|STORED_PROCEDURE_EXEC", "target_entity": "<table or entity name>", "execution_mechanism": "<e.g. embedded SQL, ORM call, stored procedure>"}], "network_and_api_calls": [""], "integration_ceiling_risk": false},
   "security_findings": {"authn_authz_checks": "", "secret_or_credential_usage": "", "pii_handling": "", "injection_risk": "", "audit_logging_behavior": ""},
   "data_lineage": {"tables_and_entities": [""], "join_and_relationship_usage": "", "transaction_boundaries": "", "file_or_message_io": "", "data_classification": ""},
   "exception_handling": {"exception_types_handled": [""], "retry_policy": "", "timeout_behavior": "", "rollback_behavior": "", "logging_and_alerting": ""},
@@ -299,7 +344,7 @@ You are the Architecture & Spec Writer Agent, the final synthesis step of a lega
   "modernization_recommendations": {"recommended_7r_strategy": "Rehost|Replatform|Refactor|Rearchitect|Rebuild|Retire|Retain", "target_architecture_pattern": "microservice|event_driven_module|serverless_function|modular_monolith_component|batch_job", "refactoring_complexity_level": "trivial|moderate|complex|extreme_risk", "estimated_person_hours": 0, "strangler_fig_suitability": false, "target_technology_stack": [""], "step_by_step_migration_plan": [""]}
 }
 
-Return ONLY the JSON object, no prose outside it, no markdown fences.
+Return ONLY the JSON object, no prose outside it, no markdown fences. Never copy this template's angle-bracketed placeholder tokens verbatim into your output -- every value must come from the real findings above.
 '@
 
 # ---------------- Ollama plumbing ----------------
@@ -524,6 +569,22 @@ function Get-UtcNowStamp {
     return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 }
 
+$script:Cp1252Encoding = [System.Text.Encoding]::GetEncoding(1252)
+
+# Reads legacy source/SQL text as Windows-1252 -- these files predate UTF-8 and
+# carry raw accented bytes (this codebase's source trees are ~80% non-ASCII by
+# file count). Get-Content's own "-Encoding Default" used to cover this, but
+# "Default" means the OS ANSI codepage under Windows PowerShell (cp1252 here)
+# and means UTF-8 under PowerShell 7/.NET Core -- same flag, silently different
+# decoding, which would corrupt every accented character the moment this script
+# runs under pwsh instead of powershell.exe. Decoding explicitly via
+# GetEncoding(1252) keeps the result identical on both engines.
+function Read-LegacySourceText {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    return $script:Cp1252Encoding.GetString($bytes)
+}
+
 function Write-Utf8NoBom {
     param([string]$Path, [string]$Content)
     # Write-then-rename instead of an in-place WriteAllText: this file
@@ -535,39 +596,60 @@ function Write-Utf8NoBom {
     # atomic on the same volume, so readers only ever see the old or the new
     # complete content, never a partial one.
     $encoding = New-Object System.Text.UTF8Encoding($false)
-    $tempPath = "$Path.tmp-$PID"
-    [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
-    if (Test-Path -LiteralPath $Path) {
-        # File.Replace's 3-arg overload throws ArgumentException ("The path
-        # is not of a legal form") when $null is passed for the backup-file
-        # argument via PowerShell's method binding -- confirmed by testing
-        # the exact same call with a real path, which succeeds. A real
-        # (throwaway) backup path avoids the bug; it's deleted right after
-        # since the replace already landed by the time we get here.
-        $backupPath = "$Path.bak-$PID"
-        # Retry on sharing violations: something (AV real-time scan, search
-        # indexer) briefly opens a just-written file often enough, under this
-        # script's write volume, to intermittently fail Replace with "The
-        # process cannot access the file because it is being used by another
-        # process." -- observed in practice cascading into repeated save
-        # failures for a worker. The lock clears on its own within
-        # milliseconds, so a short retry absorbs it instead of failing the
-        # whole stage/file over a transient scan.
-        $maxAttempts = 5
-        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            try {
-                [System.IO.File]::Replace($tempPath, $Path, $backupPath)
-                break
+
+    # Verify-and-retry the whole write: confirmed in practice (twice, on
+    # manifest.json) that something external can inject a single stray
+    # character into an otherwise-correct write -- both times a non-ASCII
+    # codepoint landing in pure whitespace, at a spot no PowerShell code path
+    # here ever touches. Consistent with the same AV-real-time-scan/indexer
+    # interference the sharing-violation retry below already suspects, just
+    # landing as content corruption instead of a locking error this time.
+    # Reading back what actually landed on disk and comparing against what
+    # was intended catches this regardless of cause; a transient collision
+    # like this essentially never repeats on an immediate retry.
+    $maxWriteAttempts = 3
+    for ($writeAttempt = 1; $writeAttempt -le $maxWriteAttempts; $writeAttempt++) {
+        $tempPath = "$Path.tmp-$PID"
+        [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
+        if (Test-Path -LiteralPath $Path) {
+            # File.Replace's 3-arg overload throws ArgumentException ("The path
+            # is not of a legal form") when $null is passed for the backup-file
+            # argument via PowerShell's method binding -- confirmed by testing
+            # the exact same call with a real path, which succeeds. A real
+            # (throwaway) backup path avoids the bug; it's deleted right after
+            # since the replace already landed by the time we get here.
+            $backupPath = "$Path.bak-$PID"
+            # Retry on sharing violations: something (AV real-time scan, search
+            # indexer) briefly opens a just-written file often enough, under this
+            # script's write volume, to intermittently fail Replace with "The
+            # process cannot access the file because it is being used by another
+            # process." -- observed in practice cascading into repeated save
+            # failures for a worker. The lock clears on its own within
+            # milliseconds, so a short retry absorbs it instead of failing the
+            # whole stage/file over a transient scan.
+            $maxReplaceAttempts = 5
+            for ($attempt = 1; $attempt -le $maxReplaceAttempts; $attempt++) {
+                try {
+                    [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+                    break
+                }
+                catch [System.IO.IOException] {
+                    if ($attempt -eq $maxReplaceAttempts) { throw }
+                    Start-Sleep -Milliseconds (100 * $attempt)
+                }
             }
-            catch [System.IO.IOException] {
-                if ($attempt -eq $maxAttempts) { throw }
-                Start-Sleep -Milliseconds (100 * $attempt)
-            }
+            Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
         }
-        Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
-    }
-    else {
-        [System.IO.File]::Move($tempPath, $Path)
+        else {
+            [System.IO.File]::Move($tempPath, $Path)
+        }
+
+        $actualContent = [System.IO.File]::ReadAllText($Path, $encoding)
+        if ($actualContent -ceq $Content) { return }
+        if ($writeAttempt -eq $maxWriteAttempts) {
+            throw "Write-Utf8NoBom: content read back from '$Path' didn't match what was written, even after $maxWriteAttempts attempts -- something external is altering this file during/after write."
+        }
+        Start-Sleep -Milliseconds (150 * $writeAttempt)
     }
 }
 
@@ -896,7 +978,7 @@ function Get-SchemaContext {
     param([System.IO.FileInfo]$SourceFile)
     $siblingSql = Get-ChildItem -LiteralPath $SourceFile.DirectoryName -Filter "*.sql" -File -ErrorAction SilentlyContinue
     if (-not $siblingSql) { return $null }
-    return ($siblingSql | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw -Encoding Default }) -join "`n`n"
+    return ($siblingSql | ForEach-Object { Read-LegacySourceText -Path $_.FullName }) -join "`n`n"
 }
 
 function Set-AgentTiming {
@@ -1090,7 +1172,7 @@ function Invoke-FileAnalysis {
     if (-not $state.started_at) { $state.started_at = Get-UtcNowStamp }
     $state.blocker_or_error = $null
 
-    $code = Get-Content -LiteralPath $sourcePath -Raw -Encoding Default
+    $code = Read-LegacySourceText -Path $sourcePath
     $schema = Get-SchemaContext -SourceFile $sourceFile
     $totalChars = $code.Length + $(if ($schema) { $schema.Length } else { 0 })
     if ($MaxContentChars -gt 0 -and $totalChars -gt $MaxContentChars) {
