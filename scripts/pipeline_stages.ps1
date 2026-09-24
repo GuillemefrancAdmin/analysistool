@@ -1,8 +1,14 @@
-# Single source of truth for the per-file analysis stage roster. Dot-sourced
-# by both run_analysis_pipeline.ps1 (which executes the stages) and
-# generate_analysis_queue.ps1 (which needs the full agent name list to seed
-# each newly-discovered file's token_usage.agents template) so neither script
-# maintains its own independent copy of the roster.
+# Single source of truth for the per-file analysis stage roster. Dot-sourced by
+# run_analysis_pipeline.ps1 (which executes the stages), generate_analysis_
+# queue.ps1 (which needs the full agent name list to seed each newly-discovered
+# file's token_usage.agents template), queue_eta.ps1 (per-stage ETA averaging)
+# and backfill_new_stage.ps1 (rewind-target lookup), so none of them keeps its
+# own independent copy of the roster.
+#
+# When to use: never run directly -- it has no entry point of its own. Edit it
+# when the stage chain itself changes (a stage added, removed, renamed, or given
+# different inputs); all four scripts above pick the change up on their next
+# run.
 #
 # Only the "uniform middle" stages -- business_domain_extractor through
 # narrative_writer -- are declared here as data. The sanitizer (reads raw

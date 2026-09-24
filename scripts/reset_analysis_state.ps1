@@ -4,6 +4,10 @@
 # states/README.md convention doc) and everything outside .analysis-state
 # (skills/, templates/, source code/, etc.) untouched.
 #
+# When to use: only when the analysis is meant to start over from scratch (it is
+# destructive), e.g. after changing the discovery scope or the stage chain. It
+# stops any running workers first, and -Regenerate rebuilds the queue afterward.
+#
 # Usage:
 #   .\reset_analysis_state.ps1                # prompts for confirmation
 #   .\reset_analysis_state.ps1 -Force         # no prompt
@@ -33,21 +37,13 @@ if (-not (Test-Path $StateRoot)) {
 # process) registers a lock file for as long as it's running. Deleting the
 # state/output files it's actively reading and writing out from under it
 # would corrupt its in-flight run, so find and stop any still-live ones
-# first. Stale locks (process no longer running) are just cleaned up.
-$liveLocks = @()
-$staleLockFiles = @()
-if (Test-Path $LocksDir) {
-    foreach ($lockFile in Get-ChildItem -Path $LocksDir -Filter "*.lock" -File) {
-        $info = Get-Content -LiteralPath $lockFile.FullName -Raw | ConvertFrom-Json
-        $proc = Get-Process -Id $info.pid -ErrorAction SilentlyContinue
-        if ($proc) {
-            $liveLocks += [pscustomobject]@{ Pid = $info.pid; WorkerIndex = $info.worker_index; LockFile = $lockFile.FullName }
-        }
-        else {
-            $staleLockFiles += $lockFile.FullName
-        }
-    }
-}
+# first. Stale locks (process no longer running) are just cleaned up. The lock
+# file's shape is parsed in one place -- see pipeline_common.ps1 -- so this
+# script and stop_analysis_pipeline.ps1 can't drift from what the runner writes.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+$locks = Get-AnalysisLocks -LocksDir $LocksDir
+$liveLocks = $locks.Live
+$staleLockFiles = $locks.StaleFiles
 foreach ($f in $staleLockFiles) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 
 # Per-file state records, but never the convention doc that lives alongside them.

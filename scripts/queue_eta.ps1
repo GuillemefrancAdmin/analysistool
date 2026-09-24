@@ -13,6 +13,10 @@
 # ever mixes samples of that one stage, regardless of how much of the rest
 # of the chain any given file happened to also run in the same pass.
 #
+# When to use: any time -- read-only and lock-free, so it is safe while workers
+# are running (run_analysis_pipeline_parallel.ps1 calls it periodically for its
+# live progress/ETA output).
+#
 # Usage:
 #   .\queue_eta.ps1                 # report against the live manifest, 1 worker
 #   .\queue_eta.ps1 -Workers 2      # divide the remaining time across N concurrent workers
@@ -23,49 +27,12 @@ param(
     [int]$Workers = 1
 )
 
-# Relaunch under PowerShell 7 when available -- see the matching block in
-# run_analysis_pipeline_parallel.ps1 for why (Windows PowerShell 5.1's
-# ConvertFrom-Json can't reliably parse manifest.json once it grows large --
-# this script hit that exact failure directly on 2026-09-22). A no-op when
-# already running under PS7, including when called in-process by an
-# already-relaunched run_analysis_pipeline_parallel.ps1.
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
-    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-    if (-not $pwshExe) {
-        $pwshExe = @(
-            "$env:ProgramFiles\PowerShell\7\pwsh.exe"
-            "$env:LOCALAPPDATA\Programs\PowerShell-7.6.6\pwsh.exe"
-        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    }
-    if ($pwshExe) {
-        # Forwarded via a small JSON bootstrap file + hashtable splat, not raw
-        # -File command-line args: confirmed by testing that -File's own
-        # argument parsing silently mangles array-typed parameters (space-
-        # separated values drop everything after the first element; a single
-        # comma-joined token doesn't get re-split into an array either).
-        # JSON round-trips every bound parameter -- arrays, switches, scalars
-        # -- exactly, then a real hashtable splat binds them correctly.
-        $paramsForward = @{}
-        foreach ($key in $PSBoundParameters.Keys) {
-            $val = $PSBoundParameters[$key]
-            if ($val -is [switch]) { $paramsForward[$key] = [bool]$val.IsPresent }
-            else { $paramsForward[$key] = $val }
-        }
-        $bootstrapPath = [System.IO.Path]::GetTempFileName()
-        $exitCode = 1
-        try {
-            ($paramsForward | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8
-            $cmd = "`$h = Get-Content -LiteralPath '$bootstrapPath' -Raw | ConvertFrom-Json -AsHashtable; & '$PSCommandPath' @h"
-            & $pwshExe -NoProfile -Command $cmd
-            $exitCode = $LASTEXITCODE
-        }
-        finally {
-            Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
-        }
-        exit $exitCode
-    }
-    Write-Host "WARNING: pwsh.exe (PowerShell 7) not found -- continuing under Windows PowerShell 5.1, which cannot reliably parse a large manifest.json." -ForegroundColor Yellow
-}
+# Relaunch under PowerShell 7 when available: manifest.json outgrows Windows
+# PowerShell 5.1's parser (this script hit that exact failure on 2026-09-22).
+# See pipeline_common.ps1 for how the parameter forwarding works. A no-op under
+# PS7, including when called in-process by an already-relaunched orchestrator.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+Restart-UnderPowerShell7 -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters
 
 $ErrorActionPreference = "Stop"
 
@@ -80,6 +47,12 @@ if (-not $ManifestPath) { $ManifestPath = Join-Path $Root ".analysis-state\queue
 . (Join-Path $PSScriptRoot "pipeline_stages.ps1")
 $StageAgents = Get-AllAgentNames | Select-Object -Skip 1
 
+# The manifest read-repair helpers (the stray-non-ASCII scan and the
+# single-bit-flip search) live in one shared file so this script repairs
+# manifest.json exactly the way run_analysis_pipeline.ps1's Read-Manifest and
+# backfill_new_stage.ps1 do.
+. (Join-Path $PSScriptRoot "manifest_repair.ps1")
+
 if (-not (Test-Path -LiteralPath $ManifestPath)) {
     throw "No manifest found at $ManifestPath. Run generate_analysis_queue.ps1 first."
 }
@@ -91,12 +64,41 @@ if (-not (Test-Path -LiteralPath $ManifestPath)) {
 # milliseconds once the other write finishes.
 $manifest = $null
 $maxAttempts = 5
+# Same one-shot rule as Read-Manifest: the bit-flip search is the expensive
+# tier, so it runs at most once rather than once per retry attempt.
+$bitFlipSearchUsed = $false
 for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    $raw = $null
     try {
-        $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $raw = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
+        $manifest = $raw | ConvertFrom-Json
         break
     }
     catch {
+        $parseErrorMessage = $_.Exception.Message
+        if ($raw) {
+            $repaired = Repair-StrayNonAsciiCharacters -Text $raw
+            if ($repaired) {
+                try {
+                    $manifest = $repaired | ConvertFrom-Json
+                    Write-Host "  [queue_eta] Auto-repaired a stray non-ASCII character in manifest.json and re-parsed successfully." -ForegroundColor Yellow
+                    break
+                }
+                catch { }
+            }
+            if (-not $bitFlipSearchUsed) {
+                $bitFlipSearchUsed = $true
+                $bitFlip = Repair-SingleBitFlipCharacter -Text $raw -ParseErrorMessage $parseErrorMessage
+                if ($bitFlip) {
+                    try {
+                        $manifest = $bitFlip.Text | ConvertFrom-Json
+                        Write-Host ("  [queue_eta] Auto-repaired a single-bit-flip substitution in manifest.json at offset {0} ('{1}' 0x{2:X4} -> '{3}' 0x{4:X4}, bit {5}, {6} chars from the reported location, after {7} candidate reparses)." -f $bitFlip.Position, $bitFlip.OriginalChar, $bitFlip.OriginalCodePoint, $bitFlip.CorrectedChar, $bitFlip.CorrectedCodePoint, $bitFlip.BitIndex, $bitFlip.Distance, $bitFlip.Attempts) -ForegroundColor Yellow
+                        break
+                    }
+                    catch { }
+                }
+            }
+        }
         if ($attempt -eq $maxAttempts) { throw }
         Start-Sleep -Milliseconds (100 * $attempt)
     }

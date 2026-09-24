@@ -15,6 +15,10 @@
 # other. This script just bootstraps the instances, launches, streams, and
 # waits.
 #
+# When to use: the normal way to run the pipeline on a multi-GPU machine (for a
+# single worker, run_analysis_pipeline.ps1 directly). Stop a run with
+# stop_analysis_pipeline.ps1.
+#
 # Usage:
 #   .\run_analysis_pipeline_parallel.ps1
 #       # starts one Ollama instance per -CudaDevices entry (default 2,
@@ -90,51 +94,15 @@ param(
     [int]$MaxWorkerRestarts = 3
 )
 
-# Relaunch under PowerShell 7 when available, before doing anything else.
-# manifest.json grows into the tens of MB over a run, and Windows PowerShell
-# 5.1's ConvertFrom-Json (JavaScriptSerializer-backed) is both far slower on
-# it than PS7's parser and, past a certain size, fails outright with a
-# garbled dump instead of a clean error (confirmed 2026-09-22: a corrupted
-# byte plus an outright-unparseable 19MB manifest). Every worker this
-# orchestrator launches via Start-Job inherits whichever engine is currently
-# running, so relaunching here also fixes every worker's own manifest reads.
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
-    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-    if (-not $pwshExe) {
-        $pwshExe = @(
-            "$env:ProgramFiles\PowerShell\7\pwsh.exe"
-            "$env:LOCALAPPDATA\Programs\PowerShell-7.6.6\pwsh.exe"
-        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    }
-    if ($pwshExe) {
-        # Forwarded via a small JSON bootstrap file + hashtable splat, not raw
-        # -File command-line args: confirmed by testing that -File's own
-        # argument parsing silently mangles array-typed parameters (space-
-        # separated values drop everything after the first element; a single
-        # comma-joined token doesn't get re-split into an array either).
-        # JSON round-trips every bound parameter -- arrays, switches, scalars
-        # -- exactly, then a real hashtable splat binds them correctly.
-        $paramsForward = @{}
-        foreach ($key in $PSBoundParameters.Keys) {
-            $val = $PSBoundParameters[$key]
-            if ($val -is [switch]) { $paramsForward[$key] = [bool]$val.IsPresent }
-            else { $paramsForward[$key] = $val }
-        }
-        $bootstrapPath = [System.IO.Path]::GetTempFileName()
-        $exitCode = 1
-        try {
-            ($paramsForward | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8
-            $cmd = "`$h = Get-Content -LiteralPath '$bootstrapPath' -Raw | ConvertFrom-Json -AsHashtable; & '$PSCommandPath' @h"
-            & $pwshExe -NoProfile -Command $cmd
-            $exitCode = $LASTEXITCODE
-        }
-        finally {
-            Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
-        }
-        exit $exitCode
-    }
-    Write-Host "WARNING: pwsh.exe (PowerShell 7) not found -- continuing under Windows PowerShell 5.1, which cannot reliably parse a large manifest.json. Install PowerShell 7 to avoid intermittent crashes/corruption." -ForegroundColor Yellow
-}
+# Relaunch under PowerShell 7 when available, before doing anything else -- see
+# pipeline_common.ps1 for why (manifest.json grows into the tens of MB and 5.1's
+# ConvertFrom-Json is both far slower on it and, past a certain size, fails
+# outright with a garbled dump instead of a clean error -- confirmed 2026-09-22)
+# and for how the parameter forwarding works. Every worker this orchestrator
+# launches via Start-Job inherits whichever engine is currently running, so
+# relaunching here also fixes every worker's own manifest reads.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+Restart-UnderPowerShell7 -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -MissingPwshMessage "pwsh.exe (PowerShell 7) not found -- continuing under Windows PowerShell 5.1, which cannot reliably parse a large manifest.json. Install PowerShell 7 to avoid intermittent crashes/corruption."
 
 $ErrorActionPreference = "Stop"
 

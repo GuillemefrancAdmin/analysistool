@@ -5,6 +5,9 @@
 #
 # Requires Node.js. On first run, installs the viewer's npm dependencies.
 #
+# When to use: any time you want to browse or search the results in a browser;
+# it never triggers or modifies a run.
+#
 # Usage:
 #   .\run_output_viewer.ps1                      # binds 127.0.0.1:5173
 #   .\run_output_viewer.ps1 -Port 8080

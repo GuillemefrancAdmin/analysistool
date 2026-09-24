@@ -36,6 +36,10 @@
 #     .\run_analysis_pipeline.ps1 -Limit 0 -OllamaUrl http://127.0.0.1:11435/v1 -CudaVisibleDevices 1 -WorkerIndex 0 -WorkerCount 2
 #     .\run_analysis_pipeline.ps1 -Limit 0 -OllamaUrl http://127.0.0.1:11436/v1 -CudaVisibleDevices 0 -WorkerIndex 1 -WorkerCount 2
 #   (run_analysis_pipeline_parallel.ps1 does this automatically.)
+#
+# When to use: to run or resume the analysis itself. One worker at a time --
+# with several GPUs use run_analysis_pipeline_parallel.ps1 instead, which
+# launches this script per worker. Stop a run with stop_analysis_pipeline.ps1.
 
 param(
     [int]$Limit = 1,
@@ -96,48 +100,12 @@ param(
     [int]$HeartbeatSeconds = 5
 )
 
-# Relaunch under PowerShell 7 when available -- see the matching block in
-# run_analysis_pipeline_parallel.ps1 for why (Windows PowerShell 5.1's
-# ConvertFrom-Json can't reliably parse manifest.json once it grows large).
-# A no-op when this is already running under PS7, including when launched
-# as a worker job by an already-relaunched orchestrator.
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
-    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-    if (-not $pwshExe) {
-        $pwshExe = @(
-            "$env:ProgramFiles\PowerShell\7\pwsh.exe"
-            "$env:LOCALAPPDATA\Programs\PowerShell-7.6.6\pwsh.exe"
-        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    }
-    if ($pwshExe) {
-        # Forwarded via a small JSON bootstrap file + hashtable splat, not raw
-        # -File command-line args: confirmed by testing that -File's own
-        # argument parsing silently mangles array-typed parameters (space-
-        # separated values drop everything after the first element; a single
-        # comma-joined token doesn't get re-split into an array either).
-        # JSON round-trips every bound parameter -- arrays, switches, scalars
-        # -- exactly, then a real hashtable splat binds them correctly.
-        $paramsForward = @{}
-        foreach ($key in $PSBoundParameters.Keys) {
-            $val = $PSBoundParameters[$key]
-            if ($val -is [switch]) { $paramsForward[$key] = [bool]$val.IsPresent }
-            else { $paramsForward[$key] = $val }
-        }
-        $bootstrapPath = [System.IO.Path]::GetTempFileName()
-        $exitCode = 1
-        try {
-            ($paramsForward | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8
-            $cmd = "`$h = Get-Content -LiteralPath '$bootstrapPath' -Raw | ConvertFrom-Json -AsHashtable; & '$PSCommandPath' @h"
-            & $pwshExe -NoProfile -Command $cmd
-            $exitCode = $LASTEXITCODE
-        }
-        finally {
-            Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
-        }
-        exit $exitCode
-    }
-    Write-Host "WARNING: pwsh.exe (PowerShell 7) not found -- continuing under Windows PowerShell 5.1, which cannot reliably parse a large manifest.json." -ForegroundColor Yellow
-}
+# Relaunch under PowerShell 7 when available -- see pipeline_common.ps1 for why
+# (manifest.json outgrows Windows PowerShell 5.1's parser) and how the parameter
+# forwarding works. A no-op when this is already running under PS7, including
+# when launched as a worker job by an already-relaunched orchestrator.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+Restart-UnderPowerShell7 -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters
 
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
@@ -190,6 +158,13 @@ $script:ManifestMutex = New-Object System.Threading.Mutex($false, "AnalysisPipel
 # only entry Get-AllAgentNames returns that $StageAgents excludes.
 . (Join-Path $PSScriptRoot "pipeline_stages.ps1")
 $StageAgents = Get-AllAgentNames | Select-Object -Skip 1
+
+# The manifest read-repair helpers both live in one shared file for the same
+# reason the roster does: this script, queue_eta.ps1 and backfill_new_stage.ps1
+# all read manifest.json and must repair the exact same corruption patterns the
+# exact same way. See manifest_repair.ps1 for what each tier covers and for the
+# real-incident evidence behind its search bounds.
+. (Join-Path $PSScriptRoot "manifest_repair.ps1")
 
 # Tag every printed line with which worker wrote it. This is done at the
 # source (not left to the parallel orchestrator's job-output prefixing)
@@ -321,10 +296,13 @@ Output ONLY the Markdown narrative as plain prose and headings. No JSON, no fenc
 $ArchitectureSpecSystemPrompt = @'
 You are the Architecture & Spec Writer Agent, the final synthesis step of a legacy modernization pipeline. You receive: the file path, and the prior findings from the Business Domain, Structural, Business Logic, Security, Performance, and Test Validation agents for one legacy source module. Compile them into a single JSON object with EXACTLY this shape (all fields required; use empty string/array/false if genuinely unknown, never omit a key).
 
-The shape below is a FORMAT TEMPLATE, not example content. Every angle-bracketed token like <string> or <short title> describes what kind of value belongs there -- it is never a literal value to copy into your output. Every array or object you emit must be built from the real findings given to you below. If a section genuinely has zero real findings, emit an empty array [], never an invented or template-derived entry.
+The shape below is a FORMAT TEMPLATE, not example content. Every angle-bracketed token like <string> or <short title> describes what kind of value belongs there -- it is never a literal value to copy into your output. Every array or object you emit must be built from the real findings given to you below. If a section genuinely has zero real findings, emit an empty array [], never an invented or template-derived entry. Every field whose template shows options separated by "|" is an enum: your value must be exactly one of those listed options, never a value outside that list -- for example, database_interactions.operation_type must be one of READ, WRITE, UPDATE, DELETE, SCHEMA_DDL, or STORED_PROCEDURE_EXEC, never a raw SQL verb like SELECT. Every closing bracket must match its own opening bracket's type ( { with }, [ with ] ) -- after finishing a nested array or object field, the very next closing bracket you write still belongs to whatever container you were in before that nested field, not to the nested field you just closed.
 
 {
   "module_metadata": {"file_path": "", "programming_language": "", "language_version": "", "module_scope": "file|class|package|procedure|module|script", "primary_purpose": ""},
+  "source_evidence": {"symbol_name": "<function, procedure, class, or routine name analyzed>", "source_line_start": 0, "source_line_end": 0, "analysis_basis": "direct_code|inferred_from_patterns|schema_cross_reference|manual_assumption", "confidence_level": 0.0, "evidence_summary": "<short narrative of the code evidence supporting this analysis>"},
+  "execution_context": {"entrypoint_type": "batch_job|api_endpoint|screen_transaction|scheduled_process|cli_command|report_generator|message_handler", "trigger_or_invocation": "<how this routine starts or is called in production>", "runtime_environment": "<OS, runtime, server, or platform context>", "config_files_used": ["<config/parameter file or manifest influencing behavior>"], "environment_variables_used": ["<env var or runtime flag consumed>"]},
+  "interface_contracts": {"input_schema": ["<input parameter, record field, or payload element accepted>"], "output_schema": ["<output value, generated record, or response field produced>"], "data_formats": ["<e.g. JSON, CSV, flat file, fixed-width, XML, DB records>"], "parameter_validation_rules": ["<rule used to reject or normalize an input value>"], "default_and_null_handling": "<description of null/default behavior>"},
   "architectural_layer": {"primary_layer": "interaction|business_logic|data_access|configuration|infrastructure|cross_cutting", "layer_confidence_score": 0.0, "entry_points": [""], "state_management_pattern": "stateless|stateful_in_memory|database_backed|session_bound|global_mutable_state"},
   "quality_metrics": {"cyclomatic_complexity": 0, "maintainability_index": 0.0, "lines_of_code": 0, "comment_density_ratio": 0.0, "halstead_volume": 0.0, "composite_quality_score": 0.0},
   "functional_requirements": [{"requirement_id": "<string, e.g. REQ-BL-001>", "title": "<short descriptive title>", "description": "<the business logic, formula, or conditional rule this requirement captures>", "business_rule_type": "computation|validation|data_transformation|workflow_routing|authorization|audit_logging", "source_line_range": "<start-end line numbers, e.g. 102-145>", "input_parameters": ["<data structure, argument, or env var this logic consumes>"], "output_artifacts": ["<return value, modified state, or external message this logic produces>"]}],
@@ -344,7 +322,7 @@ The shape below is a FORMAT TEMPLATE, not example content. Every angle-bracketed
   "modernization_recommendations": {"recommended_7r_strategy": "Rehost|Replatform|Refactor|Rearchitect|Rebuild|Retire|Retain", "target_architecture_pattern": "microservice|event_driven_module|serverless_function|modular_monolith_component|batch_job", "refactoring_complexity_level": "trivial|moderate|complex|extreme_risk", "estimated_person_hours": 0, "strangler_fig_suitability": false, "target_technology_stack": [""], "step_by_step_migration_plan": [""]}
 }
 
-Return ONLY the JSON object, no prose outside it, no markdown fences. Never copy this template's angle-bracketed placeholder tokens verbatim into your output -- every value must come from the real findings above.
+Return ONLY the JSON object, no prose outside it, no markdown fences. Never copy this template's angle-bracketed placeholder tokens verbatim into your output -- every value must come from the real findings above. If a string value itself contains a double-quote character -- a quoted variable name, file path, or source snippet you are echoing -- escape it as \" ; never leave a bare " inside a string value.
 '@
 
 # ---------------- Ollama plumbing ----------------
@@ -585,74 +563,13 @@ function Read-LegacySourceText {
     return $script:Cp1252Encoding.GetString($bytes)
 }
 
-function Write-Utf8NoBom {
-    param([string]$Path, [string]$Content)
-    # Write-then-rename instead of an in-place WriteAllText: this file
-    # (manifest.json in particular) is read by other processes -- worker
-    # threads and queue_eta.ps1 -- with no lock on the read side. WriteAllText
-    # truncates the destination before writing, so a concurrent reader can
-    # catch it mid-write and get a torn/empty fragment (observed as
-    # "ConvertFrom-Json: Invalid JSON primitive: ."). File.Replace/Move is
-    # atomic on the same volume, so readers only ever see the old or the new
-    # complete content, never a partial one.
-    $encoding = New-Object System.Text.UTF8Encoding($false)
+# Write-Utf8NoBom (the atomic, verified manifest write) comes from
+# pipeline_common.ps1, dot-sourced near the top of this script -- this script,
+# backfill_new_stage.ps1 and generate_analysis_queue.ps1 all write manifest.json
+# and used to carry their own copy of it.
 
-    # Verify-and-retry the whole write: confirmed in practice (twice, on
-    # manifest.json) that something external can inject a single stray
-    # character into an otherwise-correct write -- both times a non-ASCII
-    # codepoint landing in pure whitespace, at a spot no PowerShell code path
-    # here ever touches. Consistent with the same AV-real-time-scan/indexer
-    # interference the sharing-violation retry below already suspects, just
-    # landing as content corruption instead of a locking error this time.
-    # Reading back what actually landed on disk and comparing against what
-    # was intended catches this regardless of cause; a transient collision
-    # like this essentially never repeats on an immediate retry.
-    $maxWriteAttempts = 3
-    for ($writeAttempt = 1; $writeAttempt -le $maxWriteAttempts; $writeAttempt++) {
-        $tempPath = "$Path.tmp-$PID"
-        [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
-        if (Test-Path -LiteralPath $Path) {
-            # File.Replace's 3-arg overload throws ArgumentException ("The path
-            # is not of a legal form") when $null is passed for the backup-file
-            # argument via PowerShell's method binding -- confirmed by testing
-            # the exact same call with a real path, which succeeds. A real
-            # (throwaway) backup path avoids the bug; it's deleted right after
-            # since the replace already landed by the time we get here.
-            $backupPath = "$Path.bak-$PID"
-            # Retry on sharing violations: something (AV real-time scan, search
-            # indexer) briefly opens a just-written file often enough, under this
-            # script's write volume, to intermittently fail Replace with "The
-            # process cannot access the file because it is being used by another
-            # process." -- observed in practice cascading into repeated save
-            # failures for a worker. The lock clears on its own within
-            # milliseconds, so a short retry absorbs it instead of failing the
-            # whole stage/file over a transient scan.
-            $maxReplaceAttempts = 5
-            for ($attempt = 1; $attempt -le $maxReplaceAttempts; $attempt++) {
-                try {
-                    [System.IO.File]::Replace($tempPath, $Path, $backupPath)
-                    break
-                }
-                catch [System.IO.IOException] {
-                    if ($attempt -eq $maxReplaceAttempts) { throw }
-                    Start-Sleep -Milliseconds (100 * $attempt)
-                }
-            }
-            Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
-        }
-        else {
-            [System.IO.File]::Move($tempPath, $Path)
-        }
-
-        $actualContent = [System.IO.File]::ReadAllText($Path, $encoding)
-        if ($actualContent -ceq $Content) { return }
-        if ($writeAttempt -eq $maxWriteAttempts) {
-            throw "Write-Utf8NoBom: content read back from '$Path' didn't match what was written, even after $maxWriteAttempts attempts -- something external is altering this file during/after write."
-        }
-        Start-Sleep -Milliseconds (150 * $writeAttempt)
-    }
-}
-
+# Repair-StrayNonAsciiCharacters (tier 1) and Repair-SingleBitFlipCharacter
+# (tier 2) live in manifest_repair.ps1, dot-sourced near the top of this script.
 function Read-Manifest {
     if (-not (Test-Path -LiteralPath $ManifestPath)) {
         throw "No manifest found at $ManifestPath. Run generate_analysis_queue.ps1 first."
@@ -664,15 +581,59 @@ function Read-Manifest {
     # torn/incomplete file even though the replace itself is atomic. Either
     # failure clears within milliseconds once the other write finishes.
     $maxAttempts = 5
+    # Tier 2 is the expensive one (a bounded search of full-document reparses),
+    # so it is attempted at most once per Read-Manifest call: repeating it on
+    # every retry would multiply its bounded cost by the retry count, and the
+    # only other reason a parse can fail here (a torn read around another
+    # process's atomic replace) is transient -- the untouched tier-1 scan still
+    # runs on every attempt.
+    $bitFlipSearchUsed = $false
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $raw = $null
         try {
-            return Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
+            return ($raw | ConvertFrom-Json)
         }
         catch [System.IO.IOException] {
             if ($attempt -eq $maxAttempts) { throw }
             Start-Sleep -Milliseconds (100 * $attempt)
         }
         catch {
+            # Parsed content, but ConvertFrom-Json failed -- try the known
+            # repairs before falling back to a normal retry. Both only fix the
+            # in-memory copy for this read; the next successful Save-Manifest
+            # call naturally heals the on-disk copy too, since it re-reads (via
+            # this same function) before writing.
+            $parseErrorMessage = $_.Exception.Message
+            if ($raw) {
+                $repaired = Repair-StrayNonAsciiCharacters -Text $raw
+                if ($repaired) {
+                    try {
+                        $result = $repaired | ConvertFrom-Json
+                        Log "  [Read-Manifest] Auto-repaired a stray non-ASCII character in manifest.json and re-parsed successfully." "Yellow"
+                        return $result
+                    }
+                    catch { }
+                }
+                if (-not $bitFlipSearchUsed) {
+                    $bitFlipSearchUsed = $true
+                    $bitFlip = Repair-SingleBitFlipCharacter -Text $raw -ParseErrorMessage $parseErrorMessage
+                    if ($bitFlip) {
+                        try {
+                            $result = $bitFlip.Text | ConvertFrom-Json
+                            # Log the forensics, not just the fact: position,
+                            # both characters, which bit, how far it was from
+                            # where the parser noticed, and how many candidates
+                            # it took are the only evidence this project ever
+                            # gets about the hardware fault behind these
+                            # incidents.
+                            Log ("  [Read-Manifest] Auto-repaired a single-bit-flip substitution in manifest.json at offset {0} ('{1}' 0x{2:X4} -> '{3}' 0x{4:X4}, bit {5}, {6} chars from the reported location, after {7} candidate reparses) and re-parsed successfully." -f $bitFlip.Position, $bitFlip.OriginalChar, $bitFlip.OriginalCodePoint, $bitFlip.CorrectedChar, $bitFlip.CorrectedCodePoint, $bitFlip.BitIndex, $bitFlip.Distance, $bitFlip.Attempts) "Yellow"
+                            return $result
+                        }
+                        catch { }
+                    }
+                }
+            }
             if ($attempt -eq $maxAttempts) { throw }
             Start-Sleep -Milliseconds (100 * $attempt)
         }
@@ -784,8 +745,28 @@ function Request-NextFile {
             $nowUtc = (Get-Date).ToUniversalTime()
             $claimed = $manifest.files | Where-Object {
                 if ($_.status -ne "in_progress") { return $false }
+                # -is [datetime] check first, not just [datetime]::Parse($_.last_updated)
+                # directly: PowerShell 7's ConvertFrom-Json auto-converts an
+                # ISO-8601 "...Z" string into an actual [datetime] with
+                # Kind=Utc, unlike Windows PowerShell 5.1, which leaves it as a
+                # plain string. Parse() only accepts a string, so handing it an
+                # already-[datetime] value forces an implicit ToString() (using
+                # the default, timezone-less format) then a re-Parse() of that
+                # -- which silently loses the UTC-ness, comes back
+                # Kind=Unspecified, and ToUniversalTime() then treats it as
+                # LOCAL time, shifting it by the machine's UTC offset (here,
+                # 4 hours) and making a genuinely stale file look like it's
+                # still fresh (or even in the future) -- confirmed as the
+                # actual cause of a real run silently never reclaiming two
+                # long-stale in_progress files after this pipeline started
+                # running under PS7.
                 $lastUpdated = $null
-                if ($_.last_updated) { try { $lastUpdated = [datetime]::Parse($_.last_updated).ToUniversalTime() } catch {} }
+                if ($_.last_updated -is [datetime]) {
+                    $lastUpdated = $_.last_updated.ToUniversalTime()
+                }
+                elseif ($_.last_updated) {
+                    try { $lastUpdated = [datetime]::Parse($_.last_updated).ToUniversalTime() } catch {}
+                }
                 return (-not $lastUpdated) -or (($nowUtc - $lastUpdated).TotalSeconds -ge $StaleSeconds)
             } | Select-Object -First 1
         }
@@ -896,6 +877,108 @@ function Repair-JsonEscapes {
         param($m)
         if ($m.Value.Length -gt 1) { $m.Value } else { '\\' }
     })
+}
+
+function Repair-UnescapedEmbeddedQuotes {
+    # architecture_spec_writer is sometimes asked to echo a quoted identifier,
+    # file path, or source snippet into a string value (e.g. "trigger_or_
+    # invocation": "Called via "SYSTEM" USING /path"). The 8B model leaves the
+    # embedded quotes unescaped, which prematurely terminates the JSON string
+    # as far as any parser is concerned. Distinguishing a real closing quote
+    # from an embedded one that should have been escaped is undecidable in
+    # general, so this uses a narrow, confidently-correct heuristic instead: a
+    # quote immediately followed (past any whitespace) by one of , } ] : is
+    # treated as a real terminator -- exactly what a closing quote always
+    # looks like in valid JSON -- and anything else is treated as an embedded
+    # quote and escaped. That makes this a no-op on already-valid JSON (a real
+    # terminator is by grammar always followed by one of those four
+    # characters), same posture as Repair-JsonEscapes/Repair-JsonTruncation,
+    # while still being wrong on rare pathological input (e.g. quoted prose
+    # that happens to end right before a naturally-occurring comma) -- an
+    # accepted trade-off for a narrow, low-volume failure mode.
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    $inString = $false
+    $escaped = $false
+    $chars = $Text.ToCharArray()
+    $closers = @(',', '}', ']', ':')
+    for ($i = 0; $i -lt $chars.Count; $i++) {
+        $ch = $chars[$i]
+        if ($inString) {
+            if ($escaped) {
+                [void]$sb.Append($ch)
+                $escaped = $false
+                continue
+            }
+            if ($ch -eq '\') {
+                [void]$sb.Append($ch)
+                $escaped = $true
+                continue
+            }
+            if ($ch -eq '"') {
+                $j = $i + 1
+                while ($j -lt $chars.Count -and [char]::IsWhiteSpace($chars[$j])) { $j++ }
+                $nextChar = if ($j -lt $chars.Count) { [string]$chars[$j] } else { $null }
+                if ($nextChar -in $closers) {
+                    [void]$sb.Append('"')
+                    $inString = $false
+                }
+                else {
+                    [void]$sb.Append('\"')
+                }
+                continue
+            }
+            [void]$sb.Append($ch)
+        }
+        else {
+            [void]$sb.Append($ch)
+            if ($ch -eq '"') { $inString = $true }
+        }
+    }
+    return $sb.ToString()
+}
+
+function Repair-MismatchedContainerClosers {
+    # architecture_spec_writer occasionally closes a container with the
+    # wrong bracket type -- confirmed as the dominant real failure mode
+    # (48/59, 81.4%, of captured .raw.txt failures): after generating a
+    # deeply-nested array-of-objects field (e.g. database_interactions
+    # inside dependencies_and_integrations), the model's closing-bracket
+    # habit repeats the array type instead of returning to the enclosing
+    # object's own type once it's actually done with that whole container.
+    # Walks the text tracking a stack of expected closers, the same
+    # approach Repair-JsonTruncation already uses -- but instead of only
+    # appending missing closers at EOF, this corrects a closer's type in
+    # place: whatever character is actually seen, the stack's own expected
+    # closer is what gets emitted. That's a no-op on already-valid JSON
+    # (there, the seen character always already equals what the stack
+    # expects, so emitting the expected one IS emitting it unchanged) and a
+    # correction wherever it doesn't.
+    param([string]$Text)
+    if (-not $Text) { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    $stack = New-Object System.Collections.Generic.Stack[char]
+    $inString = $false
+    $escaped = $false
+    foreach ($ch in $Text.ToCharArray()) {
+        if ($inString) {
+            [void]$sb.Append($ch)
+            if ($escaped) { $escaped = $false }
+            elseif ($ch -eq '\') { $escaped = $true }
+            elseif ($ch -eq '"') { $inString = $false }
+            continue
+        }
+        switch ($ch) {
+            '"' { $inString = $true; [void]$sb.Append($ch) }
+            '{' { $stack.Push('}'); [void]$sb.Append($ch) }
+            '[' { $stack.Push(']'); [void]$sb.Append($ch) }
+            '}' { [void]$sb.Append($(if ($stack.Count -gt 0) { $stack.Pop() } else { $ch })) }
+            ']' { [void]$sb.Append($(if ($stack.Count -gt 0) { $stack.Pop() } else { $ch })) }
+            default { [void]$sb.Append($ch) }
+        }
+    }
+    return $sb.ToString()
 }
 
 function Repair-JsonTruncation {
@@ -1322,8 +1405,17 @@ function Invoke-FileAnalysis {
 
         $outputRefs = @()
         try {
-            $parsed = (Repair-JsonTruncation (Repair-JsonEscapes (Remove-CodeFence $rawReport))) | ConvertFrom-Json
+            $parsed = (Repair-JsonTruncation (Repair-MismatchedContainerClosers (Repair-UnescapedEmbeddedQuotes (Repair-JsonEscapes (Remove-CodeFence $rawReport))))) | ConvertFrom-Json
             $parsed.module_metadata.file_path = $relativePath
+            # token_usage is API call metadata the model has no way to know about
+            # itself -- injected from this file's own already-tracked processing
+            # history instead of being requested in the prompt at all. Add-Member
+            # -Force (not plain assignment): a ConvertFrom-Json object doesn't
+            # already have this property, and plain assignment to a
+            # not-yet-existing property throws under Windows PowerShell 5.1 (same
+            # reasoning as Update-ManifestEntry's blocker_or_error/
+            # output_references assignments below).
+            $parsed | Add-Member -NotePropertyName token_usage -NotePropertyValue $state.token_usage -Force
             $reportFileName = "$leafName.json"
             $reportPath = Join-Path $outDir $reportFileName
             Write-Utf8NoBom -Path $reportPath -Content (($parsed | ConvertTo-Json -Depth 10) + "`n")

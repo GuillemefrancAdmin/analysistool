@@ -21,20 +21,13 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LocksDir = Join-Path $RepoRoot ".analysis-state\locks"
 
-$liveLocks = @()
-$staleLockFiles = @()
-if (Test-Path $LocksDir) {
-    foreach ($lockFile in Get-ChildItem -Path $LocksDir -Filter "*.lock" -File) {
-        $info = Get-Content -LiteralPath $lockFile.FullName -Raw | ConvertFrom-Json
-        $proc = Get-Process -Id $info.pid -ErrorAction SilentlyContinue
-        if ($proc) {
-            $liveLocks += [pscustomobject]@{ Pid = $info.pid; WorkerIndex = $info.worker_index; LockFile = $lockFile.FullName }
-        }
-        else {
-            $staleLockFiles += $lockFile.FullName
-        }
-    }
-}
+# The lock file's shape is parsed in one place (see pipeline_common.ps1), so
+# this script and reset_analysis_state.ps1 can't drift from what
+# run_analysis_pipeline.ps1 actually writes.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+$locks = Get-AnalysisLocks -LocksDir $LocksDir
+$liveLocks = $locks.Live
+$staleLockFiles = $locks.StaleFiles
 foreach ($f in $staleLockFiles) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 
 if ($liveLocks.Count -eq 0) {

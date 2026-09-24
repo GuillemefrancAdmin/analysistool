@@ -1,5 +1,5 @@
-# PowerShell port of generate_analysis_queue.py. Discovers legacy source
-# files under the documented discovery_scope, builds/refreshes
+# Builds (and later refreshes) the analysis queue: discovers legacy source files
+# under the documented discovery_scope, writes/updates
 # .analysis-state/queue/manifest.json, and creates a per-file state record
 # under .analysis-state/states/ for any file that doesn't already have one.
 #
@@ -8,6 +8,11 @@
 # deterministically from each file's own relative path, so collisions
 # between files that share a base name (e.g. README.md in several folders)
 # always resolve to the same name on every run.
+#
+# When to use: first, to create the queue; again after new source files are
+# added (only the missing ones are appended), or after the discovery scope
+# changes. Must be run before run_analysis_pipeline.ps1 /
+# run_analysis_pipeline_parallel.ps1 have anything to process.
 #
 # Usage:
 #   .\generate_analysis_queue.ps1
@@ -48,42 +53,21 @@ $SpecialFileNames = @("env.inc", "global.config.php", "dsn.html", "dsnmssql.html
 . (Join-Path $PSScriptRoot "pipeline_stages.ps1")
 $AgentNames = Get-AllAgentNames
 
+# Manifest plumbing: Write-Utf8NoBom (the atomic, verified write) lives in
+# pipeline_common.ps1, since this script writes the same manifest.json the
+# pipeline runner and backfill do, and all three used to carry their own copy.
+# This script needs no PowerShell 7 relaunch -- it only writes the manifest, it
+# never parses a large one back.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+
 function Get-UtcNowStamp {
     return (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 }
 
-function Write-Utf8NoBom {
-    param([string]$Path, [string]$Content)
-    # Atomic write-then-rename -- see the matching comment in
-    # run_analysis_pipeline.ps1's Write-Utf8NoBom for why (torn reads of
-    # manifest.json by concurrent readers like queue_eta.ps1).
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    $tempPath = "$Path.tmp-$PID"
-    [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
-    if (Test-Path -LiteralPath $Path) {
-        # See the matching comment in run_analysis_pipeline.ps1's
-        # Write-Utf8NoBom -- File.Replace's 3-arg overload throws on a
-        # $null backup-file argument here; a real throwaway path works.
-        $backupPath = "$Path.bak-$PID"
-        # Retry on transient sharing violations (AV/indexer) -- see the
-        # matching comment in run_analysis_pipeline.ps1's Write-Utf8NoBom.
-        $maxAttempts = 5
-        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            try {
-                [System.IO.File]::Replace($tempPath, $Path, $backupPath)
-                break
-            }
-            catch [System.IO.IOException] {
-                if ($attempt -eq $maxAttempts) { throw }
-                Start-Sleep -Milliseconds (100 * $attempt)
-            }
-        }
-        Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
-    }
-    else {
-        [System.IO.File]::Move($tempPath, $Path)
-    }
-}
+# Write-Utf8NoBom (the atomic, verified manifest write) comes from
+# pipeline_common.ps1, dot-sourced above. This script's own copy predated the
+# read-back verification the other two gained -- exactly the kind of drift the
+# shared file exists to remove.
 
 function Get-RelativePosixPath {
     param([string]$FullPath, [string]$RootPath)

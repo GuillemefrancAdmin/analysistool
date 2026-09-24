@@ -18,40 +18,11 @@ param(
     [string]$SchemaPath = ""
 )
 
-# Relaunch under PowerShell 7 -- Test-Json doesn't exist in Windows
-# PowerShell 5.1 at all (added in PS 6.1), so this script can't run there
-# regardless of manifest/output size. See the matching, more fully-commented
-# block in run_analysis_pipeline_parallel.ps1.
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
-    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-    if (-not $pwshExe) {
-        $pwshExe = @(
-            "$env:ProgramFiles\PowerShell\7\pwsh.exe"
-            "$env:LOCALAPPDATA\Programs\PowerShell-7.6.6\pwsh.exe"
-        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    }
-    if ($pwshExe) {
-        $paramsForward = @{}
-        foreach ($key in $PSBoundParameters.Keys) {
-            $val = $PSBoundParameters[$key]
-            if ($val -is [switch]) { $paramsForward[$key] = [bool]$val.IsPresent }
-            else { $paramsForward[$key] = $val }
-        }
-        $bootstrapPath = [System.IO.Path]::GetTempFileName()
-        $exitCode = 1
-        try {
-            ($paramsForward | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8
-            $cmd = "`$h = Get-Content -LiteralPath '$bootstrapPath' -Raw | ConvertFrom-Json -AsHashtable; & '$PSCommandPath' @h"
-            & $pwshExe -NoProfile -Command $cmd
-            $exitCode = $LASTEXITCODE
-        }
-        finally {
-            Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
-        }
-        exit $exitCode
-    }
-    throw "pwsh.exe (PowerShell 7) not found -- Test-Json requires PS 6.1+, this script cannot run under Windows PowerShell 5.1."
-}
+# Relaunch under PowerShell 7 -- Test-Json doesn't exist in Windows PowerShell
+# 5.1 at all (added in PS 6.1), so this script cannot run there regardless of
+# manifest/output size. See pipeline_common.ps1 for the forwarding details.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+Restart-UnderPowerShell7 -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -Required -MissingPwshMessage "pwsh.exe (PowerShell 7) not found -- Test-Json requires PS 6.1+, this script cannot run under Windows PowerShell 5.1."
 
 $ErrorActionPreference = "Stop"
 

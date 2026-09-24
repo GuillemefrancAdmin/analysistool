@@ -32,6 +32,10 @@
 # cross-process mutex run_analysis_pipeline.ps1's Save-Manifest uses, so it
 # can't interleave with a live worker's own manifest write.
 #
+# When to use: after a stage is added to the roster, or after an existing
+# stage's prompt/behavior changes, and you want files that already completed
+# the chain to pick that up -- report-only until you pass -Force.
+#
 # Usage:
 #   .\backfill_new_stage.ps1 -NewStageName narrative_writer
 #       # report-only: prints how many files would be touched, writes nothing
@@ -48,47 +52,11 @@ param(
     [switch]$EvenIfAlreadyRun
 )
 
-# Relaunch under PowerShell 7 when available -- see the matching block in
-# run_analysis_pipeline_parallel.ps1 for why (Windows PowerShell 5.1's
-# ConvertFrom-Json can't reliably parse manifest.json once it grows large,
-# and this script reads/rewrites the whole thing).
-if ($PSVersionTable.PSEdition -eq 'Desktop') {
-    $pwshExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-    if (-not $pwshExe) {
-        $pwshExe = @(
-            "$env:ProgramFiles\PowerShell\7\pwsh.exe"
-            "$env:LOCALAPPDATA\Programs\PowerShell-7.6.6\pwsh.exe"
-        ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    }
-    if ($pwshExe) {
-        # Forwarded via a small JSON bootstrap file + hashtable splat, not raw
-        # -File command-line args: confirmed by testing that -File's own
-        # argument parsing silently mangles array-typed parameters (space-
-        # separated values drop everything after the first element; a single
-        # comma-joined token doesn't get re-split into an array either).
-        # JSON round-trips every bound parameter -- arrays, switches, scalars
-        # -- exactly, then a real hashtable splat binds them correctly.
-        $paramsForward = @{}
-        foreach ($key in $PSBoundParameters.Keys) {
-            $val = $PSBoundParameters[$key]
-            if ($val -is [switch]) { $paramsForward[$key] = [bool]$val.IsPresent }
-            else { $paramsForward[$key] = $val }
-        }
-        $bootstrapPath = [System.IO.Path]::GetTempFileName()
-        $exitCode = 1
-        try {
-            ($paramsForward | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $bootstrapPath -Encoding UTF8
-            $cmd = "`$h = Get-Content -LiteralPath '$bootstrapPath' -Raw | ConvertFrom-Json -AsHashtable; & '$PSCommandPath' @h"
-            & $pwshExe -NoProfile -Command $cmd
-            $exitCode = $LASTEXITCODE
-        }
-        finally {
-            Remove-Item -LiteralPath $bootstrapPath -Force -ErrorAction SilentlyContinue
-        }
-        exit $exitCode
-    }
-    Write-Host "WARNING: pwsh.exe (PowerShell 7) not found -- continuing under Windows PowerShell 5.1, which cannot reliably parse a large manifest.json." -ForegroundColor Yellow
-}
+# Relaunch under PowerShell 7 when available: this script reads and rewrites the
+# whole manifest, which outgrows Windows PowerShell 5.1's parser. See
+# pipeline_common.ps1 for how the parameter forwarding works.
+. (Join-Path $PSScriptRoot "pipeline_common.ps1")
+Restart-UnderPowerShell7 -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters
 
 $ErrorActionPreference = "Stop"
 
@@ -98,43 +66,18 @@ $ManifestPath = Join-Path $StateRoot "queue\manifest.json"
 
 . (Join-Path $PSScriptRoot "pipeline_stages.ps1")
 
-function Write-Utf8NoBom {
-    param([string]$Path, [string]$Content)
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    # Verify-and-retry the whole write: confirmed in practice (twice, on
-    # manifest.json) that something external can inject a single stray
-    # character into an otherwise-correct write -- see the matching, more
-    # fully-commented version of this function in run_analysis_pipeline.ps1.
-    $maxWriteAttempts = 3
-    for ($writeAttempt = 1; $writeAttempt -le $maxWriteAttempts; $writeAttempt++) {
-        $tempPath = "$Path.tmp-$PID"
-        [System.IO.File]::WriteAllText($tempPath, $Content, $encoding)
-        if (Test-Path -LiteralPath $Path) {
-            $backupPath = "$Path.bak-$PID"
-            $maxReplaceAttempts = 5
-            for ($attempt = 1; $attempt -le $maxReplaceAttempts; $attempt++) {
-                try {
-                    [System.IO.File]::Replace($tempPath, $Path, $backupPath)
-                    break
-                }
-                catch [System.IO.IOException] {
-                    if ($attempt -eq $maxReplaceAttempts) { throw }
-                    Start-Sleep -Milliseconds (100 * $attempt)
-                }
-            }
-            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
-        } else {
-            Move-Item -LiteralPath $tempPath -Destination $Path
-        }
+# The manifest read-repair helpers (the stray-non-ASCII scan and the
+# single-bit-flip search) live in one shared file so this script repairs
+# manifest.json exactly the way run_analysis_pipeline.ps1's Read-Manifest and
+# queue_eta.ps1 do -- it used to carry its own third, subtly different inline
+# copy of just the first scan.
+. (Join-Path $PSScriptRoot "manifest_repair.ps1")
 
-        $actualContent = [System.IO.File]::ReadAllText($Path, $encoding)
-        if ($actualContent -ceq $Content) { return }
-        if ($writeAttempt -eq $maxWriteAttempts) {
-            throw "Write-Utf8NoBom: content read back from '$Path' didn't match what was written, even after $maxWriteAttempts attempts -- something external is altering this file during/after write."
-        }
-        Start-Sleep -Milliseconds (150 * $writeAttempt)
-    }
-}
+# Write-Utf8NoBom (the atomic, verified manifest write) comes from
+# pipeline_common.ps1, dot-sourced at the top of this script -- this script,
+# run_analysis_pipeline.ps1 and generate_analysis_queue.ps1 all write
+# manifest.json and used to carry their own copy, one of which had silently
+# missed the read-back verification the others gained.
 
 # Full execution-order stage name list (matches run_analysis_pipeline.ps1's
 # own $StageAgents scope: no file_queue_orchestrator_agent, since that's not
@@ -161,7 +104,39 @@ try {
     catch [System.Threading.AbandonedMutexException] { $acquired = $true }
     if (-not $acquired) { throw "Timed out waiting for the cross-process manifest lock." }
 
-    $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    # Auto-repairs both known manifest.json corruption patterns -- see
+    # manifest_repair.ps1 for what each tier covers and the real-incident
+    # evidence behind it. Same posture as the other two readers: neither repair
+    # is used unless it actually re-parses, and if neither applies this throws
+    # exactly as it did before either tier existed.
+    $manifestRaw = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
+    $manifest = $null
+    $manifestParseError = ""
+    try {
+        $manifest = $manifestRaw | ConvertFrom-Json
+    }
+    catch {
+        $manifestParseError = $_.Exception.Message
+        $strayRepair = Repair-StrayNonAsciiCharacters -Text $manifestRaw
+        if ($strayRepair) {
+            try {
+                $manifest = $strayRepair | ConvertFrom-Json
+                Write-Host "Auto-repaired a stray non-ASCII character in manifest.json and re-parsed successfully." -ForegroundColor Yellow
+            }
+            catch { $manifest = $null }
+        }
+        if (-not $manifest) {
+            $bitFlip = Repair-SingleBitFlipCharacter -Text $manifestRaw -ParseErrorMessage $manifestParseError
+            if ($bitFlip) {
+                try {
+                    $manifest = $bitFlip.Text | ConvertFrom-Json
+                    Write-Host ("Auto-repaired a single-bit-flip substitution in manifest.json at offset {0} ('{1}' 0x{2:X4} -> '{3}' 0x{4:X4}, bit {5}, {6} chars from the reported location, after {7} candidate reparses) and re-parsed successfully." -f $bitFlip.Position, $bitFlip.OriginalChar, $bitFlip.OriginalCodePoint, $bitFlip.CorrectedChar, $bitFlip.CorrectedCodePoint, $bitFlip.BitIndex, $bitFlip.Distance, $bitFlip.Attempts) -ForegroundColor Yellow
+                }
+                catch { $manifest = $null }
+            }
+        }
+        if (-not $manifest) { throw }
+    }
 
     $targets = $manifest.files | Where-Object {
         $_.status -eq "completed" -and
