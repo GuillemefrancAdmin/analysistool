@@ -15,7 +15,7 @@ Each discovered source file SHALL have exactly one corresponding state file name
 
 #### Scenario: State file fields present after any update
 - **WHEN** a file's state is saved after any pipeline stage
-- **THEN** the state file contains all of `source_path`, `status`, `last_completed_stage`, `updated_at`, `blocker_or_error`, `next_action`, `output_references`, and `token_usage.agents.<agent_name>` entries for every one of the eleven agent names
+- **THEN** the state file contains all of `source_path`, `status`, `last_completed_stage`, `updated_at`, `blocker_or_error`, `next_action`, `output_references`, and a `token_usage.agents.<agent_name>` entry for every agent name in the shared stage registry's full roster (see `pipeline-stage-registry`), each built from the one canonical empty-agent-usage template
 
 ### Requirement: Status-based state file relocation
 A file's state record SHALL be relocated from `states/` into a status-specific subfolder — `states/done/` on completion, `states/blocked/` on blocking — so the top-level `states/` folder reflects only files still in flight; the manifest's `state_file` reference SHALL be updated to match.
@@ -43,9 +43,21 @@ Generated outputs for a file (sanitized/intermediate stage text, the final JSON 
 - **THEN** its output folder contains a copy of the original source file, an `intermediates/` folder with each stage's saved text, the final `<file>.json` report, and (if that stage itself completed) `<file>.md` and `diagram.mmd`
 
 ### Requirement: Manifest is the live, mutable index
-`.analysis-state/queue/manifest.json` SHALL be the single mutable index of all tracked files and their status, safe for concurrent read by reporting tools (`queue_eta.ps1`) and concurrent read-modify-write by multiple pipeline workers, via the write safety and locking behavior defined in `source-discovery-queue` and `sequential-pipeline-execution`.
+`.analysis-state/queue/manifest.json` SHALL be the single mutable index of all tracked files and their status, safe for concurrent read by reporting tools (`queue_eta.ps1`) and concurrent read-modify-write by multiple pipeline workers, via the write safety and locking behavior defined in `source-discovery-queue` and `sequential-pipeline-execution`. Readers of the manifest SHALL additionally attempt to auto-repair known, narrow corruption patterns before falling back to their existing retry/failure behavior: first, a small number of non-ASCII characters appearing in raw JSON structural whitespace (since the manifest's own content is always plain ASCII, any such character is reliably corruption); and if that doesn't apply or doesn't succeed, a bounded search for a single-bit-flip-plausible character substitution near the parse failure's reported location.
 
 #### Scenario: Manifest reflects current queue state at any time
 - **WHEN** the manifest is read at any point during or between runs
 - **THEN** it lists every discovered file with its current `status`, `last_completed_stage`, and `token_usage`, consistent with each file's own state file
+
+#### Scenario: A known stray-character corruption is repaired transparently
+- **WHEN** a manifest read fails to parse as JSON, and the raw content contains five or fewer characters outside the normal ASCII range
+- **THEN** the reader replaces those characters and retries parsing once before falling back to its normal retry/failure behavior, and if the repaired content parses successfully, the read succeeds using the repaired content without the caller needing to handle the failure
+
+#### Scenario: A single-bit-flip-style character substitution is repaired transparently
+- **WHEN** a manifest read fails to parse as JSON, the non-ASCII repair doesn't apply or doesn't succeed, and a bounded search near the parse failure's reported location finds a single-bit-flip variant of some nearby character that makes the entire document parse successfully
+- **THEN** the reader uses that repaired content, within a bounded number of search attempts, without the caller needing to handle the failure
+
+#### Scenario: An unfamiliar or larger-scale corruption is not silently guessed at
+- **WHEN** a manifest read fails to parse as JSON, and neither the non-ASCII repair nor the bounded bit-flip search (within its attempt budget) produces content that parses successfully
+- **THEN** the reader does not accept a guessed repair, and falls through to its existing retry-then-throw behavior instead
 

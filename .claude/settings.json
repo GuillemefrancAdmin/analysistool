@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find .analysis-state/outputs -name \"*.raw.txt\" > /tmp_list_dummy 2>/dev/null; find .analysis-state/outputs -name \"*.raw.txt\" | head -50)",
+      "Bash(awk 'NR%29==0')",
+      "Bash(xxd)",
+      "Bash(stat -c '%y %n' \".analysis-state/outputs/SIGARE-WEB/php/intranet/php_writeexcel/example-bigfile.php/example-bigfile.php.raw.txt\" \".analysis-state/outputs/GESACAD/dcl/prod_1541_spec1_20103.com/prod_1541_spec1_20103.com.raw.txt\")",
+      "Read(//f/analysistool/**)"
+    ],
+    "additionalDirectories": [
+      "\\"
+    ]
+  }
+}

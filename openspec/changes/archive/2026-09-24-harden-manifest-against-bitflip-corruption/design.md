@@ -1,0 +1,48 @@
+## Context
+
+`self-heal-manifest-reads` added `Repair-StrayNonAsciiCharacters`: scan the whole text for characters outside normal ASCII range, and if there are five or fewer, blank them out and retry parsing. That catches insertion-of-a-stray-character corruption (confirmed working, twice, on the original `U+1020` pattern) but not substitution-of-an-existing-character-with-another-plausible-ASCII-character (the `"`→`2` incident) — a normal ASCII digit isn't "suspicious" by that scanner's definition.
+
+Both confirmed incidents are exactly one bit different from the correct value. That's the key fact this design exploits: rather than searching for "any character that looks wrong" (impossible for an ASCII-to-ASCII substitution — a `2` looks exactly as legitimate as any other digit out of context), search for "a position where flipping one bit of the character there would make the document parse" — a much narrower, better-justified search.
+
+**The performance constraint that shapes this whole design**: `manifest.json` is multi-megabyte (7-20MB across this session). A full `ConvertFrom-Json` parse of a document that size is not free — plausibly 100-500ms. A naive approach (try every candidate character × every candidate substitution, full-document-reparse each time) is combinatorially infeasible: even a modest ±100-character window with a broad substitution-character set could mean hundreds of reparse attempts, i.e. minutes, for what needs to be a fast recovery path.
+
+## Goals / Non-Goals
+
+**Goals:**
+- Recover from single-bit-flip-style ASCII-to-ASCII substitution corruption, the class `Repair-StrayNonAsciiCharacters` structurally cannot detect.
+- Keep worst-case repair time bounded to a few seconds even against a large manifest — a slow-but-working repair that takes minutes isn't meaningfully better than today's manual-repair fallback.
+- Stay conservative: never accept a substitution that doesn't make the *entire* document parse; never silently guess when the budget is exhausted.
+
+**Non-Goals:**
+- A general "find and fix arbitrary JSON corruption" capability — scoped specifically to single-bit-flip-plausible single-character substitutions, the one class this session has concrete evidence for.
+- Applying this to `architecture_spec_writer`'s own repair chain — that chain's failure classes (prose/fences, bad escapes, embedded quotes, mismatched closers) are LLM-output-specific and already have dedicated repairs; this is about `manifest.json`'s own, differently-caused corruption.
+- Root-causing or fixing the underlying hardware issue — out of this project's reach in software.
+
+## Decisions
+
+**Bit-flip-informed candidate generation, not a broad "try common JSON characters" list.** For a character at a candidate position, generate its 16 single-bit-flip variants (one per bit of the UTF-16 code unit) rather than trying an arbitrary substitution alphabet. This is directly justified by the confirmed root cause (both real incidents are exactly one bit off) and keeps the candidate set per position small and bounded (16, not an open-ended alphabet), which is what makes a bounded total-attempt budget feasible at all.
+
+**Use the JSON parser's own reported line/position as a search-window seed, not the sole target.** Confirmed empirically that the reported position isn't always exactly on the corrupted character (one incident's error pointed one line past the actual corruption) — likely because the parser only notices something's wrong once it's consumed a few more tokens past the actual break. A small window of nearby characters (both before and after the reported position) is searched, not just the one exact position.
+
+**Total re-parse attempts are capped, tried in priority order (most bit-flip-plausible-and-contextually-common characters first), not exhaustive.** Every candidate substitution requires a full-document reparse to confirm it actually works (there's no cheaper reliable validity check across an arbitrary JSON document) — that reparse cost is what has to be bounded. Trying the window's characters nearest the reported position first, and each one's bit-flip candidates in an order weighted toward producing common JSON syntax characters (`"`, `,`, `:`, `{`, `}`, `[`, `]`, space) over control characters, maximizes the chance of finding the real fix within a small attempt budget. If the budget is exhausted without success, fall through to the existing retry/throw behavior — same as `Repair-StrayNonAsciiCharacters` already does when its own conditions aren't met.
+
+**Tuned against the surviving real backups, which also settled the candidate ordering.** All three backups still on disk (`.analysis-state/queue/manifest.json.pre-repair-backup-*` — only 3 of the 5 incidents' backups survived, and two of those are the same incident) are single-bit flips exactly **10 characters before** the offset the failing parse reports, so the chosen search window is 64 characters each side (~6x margin), with a 200-attempt cap and a 5-second wall-clock cap. Measured: the real fix is found at attempt 14-15, a full-window search that finds nothing costs ~1.5s against the live 7.0MB manifest, and per-candidate validation costs 8-14ms with `System.Text.Json.JsonDocument` reading straight out of a mutable char buffer versus ~500ms with `ConvertFrom-Json` — the reason the wall-clock cap exists as well as the attempt cap (Windows PowerShell 5.1 has no JsonDocument, and in practice its parse errors carry no line/position at all, so the tier is simply a no-op there).
+Inside that budget, ordering by *candidate class* (all priority-0 "common JSON syntax character" candidates, nearest position first, then the remaining printable-ASCII candidates, then the rest) reaches the real fix at rank 14-16 on both distinct corrupted backups, while ordering strictly by position — exhausting each position's 16 variants before moving to the next — reaches it at rank 309-317. Same intent as the ordering decision above (common JSON syntax characters before control characters), just applied across the window instead of within one position, and it is what makes a budget this small sufficient.
+
+**Exact window size and attempt budget are implementation-time tuning decisions**, not fixed here, to be validated against this session's five real incidents — backup copies of all of them (`manifest.json.pre-repair-backup-*` under `.analysis-state/queue/`) are still on disk and usable as real fixtures, not just synthetic test cases, which is a stronger validation basis than could be designed abstractly.
+
+## Risks / Trade-offs
+
+- **[Risk] A bounded search could still fail to find the actual corruption if it's further from the reported position than the window covers, or isn't a single-bit-flip at all (e.g. a two-bit flip, or a different corruption mechanism entirely).** → Accepted: this is explicitly a best-effort second tier, not a guarantee — falling through to the existing (already proven, if manual) retry/throw/manual-repair path is always the safety net, exactly as it is today. Verification pinned down what the second half of that looks like in practice: with a two-bit flip on a quote, the search still accepted a parseable candidate (a quote restored one character to the left), so the run continues with one JSON key renamed instead of stopping. The callers log the offset and both characters, so it is visible rather than silent, but it is the concrete cost of "the whole document parses" as the acceptance test — tightening it (a much smaller radius, or checking the repair against the JSON path the failing parse reported) is the follow-up if that trade-off is judged wrong.
+- **[Risk] Even a bounded search adds real latency (multiple full-document reparses) to what's currently an instant failure.** → Mitigated by the attempt cap; accepted that a bounded number of seconds of extra latency on a rare failure path is a clear improvement over the current alternative (the run stops entirely and waits for manual intervention).
+- **[Trade-off] This is meaningfully more complex than the first self-heal tier** (a bounded search with a priority-ordered candidate generator, vs. a single whole-file scan). → Justified by being the direct, evidence-based response to a real, recurring, already-proven-costly failure mode (five incidents this session alone), not speculative hardening.
+
+## Migration Plan
+
+None — purely additive to the existing read-repair paths. No manifest format change, no effect on already-completed files.
+
+## Open Questions
+
+- ~~Exact window size and attempt-budget numbers~~ — resolved during implementation: **64 characters each side, 200 attempts, 5-second wall-clock cap**, validated against the real backups that remain (3 of the 5; see the Decisions entry above and `scripts/manifest_repair.ps1`).
+- ~~Whether to log which specific bit-flip candidate succeeded as additional forensic data~~ — done: `Repair-SingleBitFlipCharacter` returns the offset, the original and corrected character with code points, the flipped bit index, the distance from the reported location, the candidate reparse count and the elapsed time, and each reader logs all of it, so incidents can be compared over time (e.g. for clustering at particular file offsets, which could point at a specific bad memory region).
+- Still open, and worth deciding before archiving: whether accepting "whatever parses" is acceptable for corruption that isn't a single-bit flip (see the first Risk above). Today it is, by design and with logging; the alternatives are a much smaller search radius or validating the repair against the parse's reported JSON path.

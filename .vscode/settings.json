@@ -1,0 +1,11 @@
+{
+    "copilot-toolbox.thinkingMachineMode.enabled": true,
+    "copilot-toolbox.thinkingMachineMode.runAwarenessScan": true,
+    "copilot-toolbox.thinkingMachineMode.mergeAwarenessIntoCopilotInstructions": true,
+    "copilot-toolbox.thinkingMachineMode.showConfirmationModal": true,
+    "copilot-toolbox.thinkingMachineMode.useSeparateContextPackDefaults": true,
+    "copilot-toolbox.thinkingMachineMode.includeGit": true,
+    "copilot-toolbox.thinkingMachineMode.includeDiagnostics": true,
+    "copilot-toolbox.thinkingMachineMode.appendNotepad": true,
+    "copilot-toolbox.thinkingMachineMode.openChat": true
+}
